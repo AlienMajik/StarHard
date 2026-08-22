@@ -17,7 +17,7 @@
 set -u
 umask 077
 
-VERSION="1.0"
+VERSION="1.1"
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/var/backups/starhard/$TS"
 LOG_DIR="/var/log/starhard"
@@ -368,7 +368,7 @@ fi
 
 # Lock down cron/at to root only
 for f in /etc/cron.allow /etc/at.allow; do
-    write_file "$f" 640 <<'EOF'
+    write_file "$f" 600 <<'EOF'
 root
 EOF
 done
@@ -623,7 +623,7 @@ tighten /boot/grub2/grub.cfg 0600
 # Home directory of invoking user
 CURRENT_USER="${SUDO_USER:-$(logname 2>/dev/null || true)}"
 if [[ -n "${CURRENT_USER:-}" && -d "/home/$CURRENT_USER" ]]; then
-    run "chmod 750 /home/$CURRENT_USER" chmod 750 "/home/$CURRENT_USER"
+    run "chmod 700 /home/$CURRENT_USER" chmod 700 "/home/$CURRENT_USER"
 fi
 
 #===============================================================================
