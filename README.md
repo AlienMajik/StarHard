@@ -125,7 +125,7 @@ sudo ./StarHard.sh --audit                          # compliance check, no chang
 | 8 | Intrusion prevention | **CrowdSec** (official repo, nftables/iptables bouncer, linux+sshd collections, journal acquisition, loopback whitelist; fail2ban stopped and masked so the two never fight) or **fail2ban** (sshd + recidive jail, recidive fixed to `backend=auto`) |
 | 9 | auditd | Identity files, sudoers, cron, SSH/PAM/MAC config, module loading, time changes, privilege escalation, mounts, deletions, permission changes, `/etc/ld.so.preload`, opens of `/dev/input/` by users (keylogger indicator), Pi boot config. Correct syscall names on aarch64. **De-duplicates against rules other tools already placed in `rules.d/`**, detects immutable mode. Process accounting + sysstat enabled |
 | 10 | AIDE | Baseline database on first run; daily check timer (or defers to the distro's own daily job) |
-| 11 | Scanning | Weekly `starhard-scan` timer: **ClamAV** (incl. mounted removable media; skips when < 1.5 GB RAM is free), **unhide**, package integrity (debsums / `rpm -V` / `pacman -Qkk`), **Lynis**. Holds idle-suspend while running so laptops finish. Installs **`starhard-status`**. Offers to remove legacy rkhunter/chkrootkit |
+| 11 | Scanning | Weekly `starhard-scan` timer: **ClamAV** (incl. mounted removable media; skips when < 1.5 GB RAM is free; honours an exclusion list at `/etc/starhard/clamav-exclude`, pre-filled on Parrot/Kali with the tool directories that contain exploit code by design), **unhide**, package integrity (debsums / `rpm -V` / `pacman -Qkk`), **Lynis**. Holds idle-suspend while running so laptops finish. Installs **`starhard-status`**. Offers to remove legacy rkhunter/chkrootkit |
 | 12 | Auto-updates | unattended-upgrades (security origin, unused-dep removal, no auto-reboot; **+ Raspberry Pi Foundation and Tailscale origins** when detected), dnf-automatic, or a zypper patch timer. Warns on rolling distros (Parrot/Kali) where there's no security pocket |
 | 13 | Banners, permissions, sudo | Legal banners (`/etc/issue`, `issue.net`, sshd `Banner`); **tighten-only** permissions (`chmod o-rwx` — never loosens RHEL's 0000 shadow); cron dirs, sudoers.d, grub.cfg, home directories; sudo `use_pty`, `logfile`, `log_input` |
 | 14 | MAC | AppArmor enabled; profiles set to enforce (server: automatic, desktop: prompted — see FAQ). SELinux status reported |
@@ -134,7 +134,7 @@ sudo ./StarHard.sh --audit                          # compliance check, no chang
 | 17 | GRUB password | Optional, interactive. Password read silently; normal boots stay unrestricted. Uses `grub2-setpassword` on RHEL/Fedora. Skipped on Raspberry Pi |
 | 18 | Lynis | Installs Lynis if missing, runs a full audit **last**, prints warnings and suggestions with each mapped to the StarHard section that addresses it (`-> section N`) or `-> manual`, annotates known false positives, tracks the hardening index across runs in `/var/lib/starhard/lynis-index` |
 | 19 | Raspberry Pi | *Auto-detected.* No-bootloader-password / encryption warning, EEPROM update check and staging, `dtoverlay=disable-bt` / `disable-wifi` (Wi-Fi refused if that's how you're connected), auditd watches on `config.txt` / `cmdline.txt`, serial console removed on server, low-RAM note for ClamAV |
-| 20 | USB device control | **USBGuard on every profile.** Devices attached at setup are allowed. *Desktop:* audit mode (all attaches logged to auditd) plus hard blocks on USB network adapters (PoisonTap class) and HID-carrying hubs (injector cables), and **new HID blocked while the screen is locked**. *Server:* everything unknown blocked. `starhard-usb-allow <id>` authorises a device |
+| 20 | USB device control | **USBGuard on every profile** (installs it if missing). Devices attached at setup are allowed. *Desktop:* audit mode (all attaches logged to auditd) plus hard blocks on USB network adapters (PoisonTap class) and HID-carrying hubs (injector cables), and **new HID blocked while the screen is locked**. *Server:* everything unknown blocked. StarHard's rules live in `/etc/usbguard/rules.d/` so a package upgrade can't erase them; daemon IPC is restricted to root (closes Debian bugs #1134751/#1135310). `starhard-usb-allow <id>` authorises a device |
 
 Sections run in numeric order except 18 (Lynis), which runs last so it audits the finished state, and 19/20 which run just before it.
 
@@ -153,7 +153,7 @@ One screen, `OK` / `--` / `!!` per line, ending in *Nothing needs attention* or 
 - **File integrity (AIDE)** — last check summary, changes in sensitive paths (`/etc/passwd`, `/etc/ssh`, `/usr/bin`…), stale-baseline detection with the rebuild command
 - **Audit trail** — event counts per key (identity, sudoers, modules, boot config, preload, input devices…) with the exact `ausearch` command to drill in; failed logins
 - **Keylogger indicators** — `/etc/ld.so.preload` and system-wide `LD_PRELOAD`; every process holding `/dev/input/*` (expected compositors `OK`, unknown `--`, anything from `/tmp`, `/home`, `/dev/shm` or a deleted binary `!!`); X11-session warning
-- **USB devices** — attached devices with vendor:product, HID/NET tagging, blocked devices with the allow command, the week's attach/block events
+- **USB devices** — attached devices with vendor:product and HID / NET / BT / STORAGE tags, blocked devices with the allow command, HID/NET devices allowed but not in the original policy, the week's attach/block events
 - **Intrusion prevention** — CrowdSec/fail2ban state, active bans, bouncer registered, warns if both are running; firewall state
 - **Lynis** — last hardening index
 
@@ -195,6 +195,29 @@ sudo reboot
 
 Rollback does not reverse package installs/removals (listed as a comment at the end of the script for you to act on). Audit rules in immutable mode reset on reboot.
 
+### Command reference
+
+Installed by StarHard into `/usr/local/sbin/` (all need `sudo`):
+
+| Command | Purpose |
+|---|---|
+| `starhard-status [--days N]` | One-screen digest of everything (default 7 days) |
+| `starhard-scan` | Run the full ClamAV + unhide + integrity + Lynis scan now |
+| `starhard-aide-check` | Run an AIDE integrity check now |
+| `starhard-usb-allow [id]` | List blocked USB devices / permanently allow one |
+
+Configuration files StarHard creates for you to edit:
+
+| File | Purpose |
+|---|---|
+| `/etc/starhard/ignore-units` | Failed systemd units `starhard-status` should not report |
+| `/etc/starhard/clamav-exclude` | Paths (regex, one per line) the weekly ClamAV scan skips |
+| `/etc/usbguard/rules.conf` | USBGuard device allow-list (snapshot + `starhard-usb-allow` additions) |
+| `/etc/usbguard/rules.d/50-starhard.conf` | StarHard's USB policy rules |
+| `/var/lib/starhard/lynis-index` | Hardening-index history, one line per run |
+
+Logs: `/var/log/starhard/` (`starhard-<ts>.log` per run, `scan-<date>.log`, `aide-<date>.log`, `lynis-report-*.dat`). Backups and rollback scripts: `/var/backups/starhard/<ts>/`.
+
 ---
 
 ## Troubleshooting
@@ -205,9 +228,13 @@ Rollback does not reverse package installs/removals (listed as a comment at the 
 
 **`starhard-status` says "AIDE baseline is stale"** — a large upgrade rewrote thousands of files. Rebuild: `sudo aideinit --yes --force` (10–20 min). On rolling distros expect this after every big upgrade.
 
-**ClamAV flagged a file** — read the signature name. Windows-malware names (`Win.Trojan.*`, `Win.Dropper.*`) on a text/JSON/rules file are usually detection data containing malware strings, not malware. Check with `file` and `head`; if it's unrecognisable binary, `sudo mv` it to a root-only directory and investigate.
+**ClamAV flagged a file** — read the signature name. Windows-malware names (`Win.Trojan.*`, `Win.Dropper.*`) on a text/JSON/rules file are usually detection data containing malware strings, not malware; on pentest distros, scanner payload files (e.g. `/etc/unicornscan/payloads.conf`) and rule sets trip signatures too. Confirm with `dpkg -S <file>` and `debsums -c <package>` (no output = unmodified package file), then add the path to `/etc/starhard/clamav-exclude` so the weekly scan skips it. Unrecognisable binary with no package owner: `sudo mv` it to a root-only directory and investigate.
 
 **USBGuard blocked something I plugged in** — `sudo starhard-usb-allow` lists blocked devices; `sudo starhard-usb-allow <id>` allows one permanently.
+
+**"Package X has no installation candidate" on Parrot/Debian** — `apt-listbugs` refuses packages with open serious bugs and, when it aborts, writes a `-30000` pin into `/etc/apt/preferences.d/apt-listbugs` that makes the package invisible to later installs. StarHard shows the bugs as info, lifts a leftover pin for the package it's installing (backed up for rollback), and proceeds. To do it by hand: delete the package's stanza from that file, then `apt-get update`.
+
+**logrotate.service failed** — usually one bad `postrotate` script in `/etc/logrotate.d/`. `journalctl -u logrotate -b` names it. A common one on Parrot is Suricata's `kill -HUP $(cat /var/run/suricata.pid)` with an empty pid file; make the kill conditional on the pid file being non-empty.
 
 **Pi-hole stopped answering LAN clients** — StarHard only opens port 53 to the LAN if the Pi-hole query log shows LAN clients. Force it: `sudo ./StarHard.sh --sections 7 --pihole-lan`.
 
@@ -239,6 +266,8 @@ Rollback does not reverse package installs/removals (listed as a comment at the 
 
 **Will it break my desktop?** It's designed not to: no services disabled, SSH password login kept, firewall only adds rules (and tells you what it'll block), USBGuard in audit mode, Tailscale and Pi-hole accommodated. The noticeable changes are stricter password rules, a 750 home directory, and new USB devices being refused while the screen is locked.
 
+**How do I know if the weekly scan found something?** `sudo starhard-status` reads the latest scan log and turns it into `OK ClamAV: 0 infected files` or `!! ClamAV: N infected file(s)` with path and signature, plus unhide and integrity results. The raw report is `/var/log/starhard/scan-<date>.log`; `sudo grep -E 'FOUND|HIDDEN' /var/log/starhard/scan-*.log` shows every hit ever recorded. Nothing is deleted or quarantined automatically.
+
 **How do I keep it hardened?** `sudo starhard-status` weekly. `sudo ./StarHard.sh --audit` after big upgrades. `sudo aideinit --yes --force` after upgrades that rewrite many files.
 
 ---
@@ -258,7 +287,9 @@ Rollback does not reverse package installs/removals (listed as a comment at the 
 - USBGuard on every profile with lock-screen HID blocking, network-adapter and injector-cable blocks, `starhard-usb-allow`
 - Tighten-only permissions (fixes RHEL shadow regression), sudo logging, journald, `/dev/shm`, ctrl-alt-del, sysstat, extra sysctls, module unloading, AppArmor enforce option, Lynis mapping and index tracking
 - GRUB password read silently (1.1 echoed it to the terminal); works on RHEL via `grub2-setpassword`
-- Scan holds idle-suspend; failed-unit ignore list
+- Scan holds idle-suspend; failed-unit ignore list; ClamAV exclusion list with pentest-distro defaults
+- apt-listbugs aware installs (shows bugs, lifts leftover pins); USBGuard rules in `rules.d/`, IPC root-only; section 20 installs usbguard itself
+- `starhard-status`: keylogger indicators, USB device section with HID/NET/BT/STORAGE tags, dual-IPS and missing-bouncer detection, stale-AIDE and scan-in-progress states
 
 **1.1** — initial multi-distro release.
 
