@@ -51,7 +51,9 @@ else
             note "ClamAV: scan in progress ($(( ${secs:-0} / 60 )) min elapsed)"
         elif grep -q 'SKIPPED: only' "$scanlog"; then note "ClamAV skipped last run (low memory)"
         else note "ClamAV: no result in log (scan interrupted?)"; fi
-    elif [[ "$inf" == "0" ]]; then ok "ClamAV: 0 infected files"
+    elif [[ "$inf" == "0" ]]; then
+        ex="$(grep -m1 -o 'exclusions applied: [0-9]*' "$scanlog" | awk '{print $3}')"
+        ok "ClamAV: 0 infected files${ex:+ (${ex} path pattern(s) excluded — /etc/starhard/clamav-exclude)}"
     else bad "ClamAV: $inf infected file(s):"; grep ' FOUND$' "$scanlog" | sed 's/^/        /'; ISSUES=$((ISSUES+1)); fi
     if grep -q 'Found HIDDEN' "$scanlog"; then bad "unhide: HIDDEN process/port reported — see $scanlog"; ISSUES=$((ISSUES+1))
     elif grep -q 'unhide' "$scanlog"; then ok "unhide: no hidden processes"; fi
@@ -120,7 +122,7 @@ fi
 pre="$(grep -ls 'LD_PRELOAD' /etc/environment /etc/profile /etc/profile.d/* /etc/bash.bashrc /etc/zsh/zshenv 2>/dev/null | tr '\n' ' ')"
 [[ -n "$pre" ]] && { bad "LD_PRELOAD set system-wide in: $pre"; ISSUES=$((ISSUES+1)); }
 # 2. Who holds the input devices right now
-known='^(Xorg|Xwayland|weston|wayfire|labwc|sway|hyprland|kwin_wayland|gnome-shell|mutter|cage|cosmic-comp|river|niri|systemd-logind|upowerd|acpid|thd|triggerhappy|kodi|kodi\.bin|steam|steamwebhelper|gamescope|retroarch|lightdm|sddm|gdm|gdm-wayland-ses|pipewire|wireplumber)$'
+known='^(systemd|Xorg|Xwayland|weston|wayfire|labwc|sway|hyprland|kwin_wayland|gnome-shell|mutter|cage|cosmic-comp|river|niri|systemd-logind|upowerd|acpid|thd|triggerhappy|kodi|kodi\.bin|steam|steamwebhelper|gamescope|retroarch|lightdm|sddm|gdm|gdm-wayland-ses|pipewire|wireplumber)$'
 holders="$(for fd in /proc/[0-9]*/fd/*; do
     t="$(readlink "$fd" 2>/dev/null)" || continue
     [[ "$t" == /dev/input/* ]] || continue
@@ -161,12 +163,17 @@ if command -v usbguard >/dev/null 2>&1 && systemctl is-active -q usbguard 2>/dev
         vid="$(echo "$line" | grep -o 'id [0-9a-f:]*' | cut -d' ' -f2)"
         ifs="$(echo "$line" | grep -o 'with-interface {[^}]*}\|with-interface [0-9a-f:]*' | head -1)"
         serial="$(echo "$line" | grep -o 'serial "[^"]*"' | cut -d'"' -f2)"
+        # interface codes are cc:ss:pp tokens; classify on the whole token, not a substring
+        toks="$(echo "$ifs" | grep -oE '\b[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}\b')"
         cls=""
-        echo "$ifs" | grep -q '03:' && cls="HID"
-        echo "$ifs" | grep -Eq '(02|e0):' && cls="${cls:+$cls+}NET"
+        echo "$toks" | grep -q '^03:' && cls="HID"
+        echo "$toks" | grep -Eq '^(02:06:|02:00:|e0:01:03|ef:04:01)' && cls="${cls:+$cls+}NET"
+        echo "$toks" | grep -q '^e0:01:01' && cls="${cls:+$cls+}BT"
+        echo "$toks" | grep -q '^08:' && cls="${cls:+$cls+}STORAGE"
+        [[ -z "$name" ]] && name="(no name)"
         if [[ "$state" == "block" || "$state" == "reject" ]]; then
             bad "BLOCKED  [$id] $vid ${name:-?} ${cls:+($cls)} — allow with: starhard-usb-allow $id"; ISSUES=$((ISSUES+1))
-        elif [[ -n "$cls" ]] && ! grep -q "serial \"$serial\"" /etc/usbguard/rules.conf 2>/dev/null && ! grep -q "id $vid" /etc/usbguard/rules.conf 2>/dev/null; then
+        elif [[ "$cls" == *HID* || "$cls" == *NET* ]] && ! grep -q "serial \"$serial\"" /etc/usbguard/rules.conf 2>/dev/null && ! grep -q "id $vid" /etc/usbguard/rules.conf 2>/dev/null; then
             note "allowed  [$id] $vid ${name:-?} ($cls) — not in the policy file (plugged in since setup)"
         else
             echo "          [$id] $vid ${name:-?}${cls:+ ($cls)}"
