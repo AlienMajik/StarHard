@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# starhard-status — one-screen digest of what the StarHard tooling has found.
+# Usage: sudo starhard-status [--days N]   (default 7)
+DAYS=7
+[[ "${1:-}" == "--days" && -n "${2:-}" ]] && DAYS="$2"
+[[ $EUID -ne 0 ]] && { echo "Run as root: sudo starhard-status"; exit 1; }
+
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'; N='\033[0m'
+ok()   { echo -e "  ${G}OK  ${N} $1"; }
+bad()  { echo -e "  ${R}!!  ${N} $1"; }
+note() { echo -e "  ${Y}--  ${N} $1"; }
+hdr()  { echo; echo -e "${B}== $1 ==${N}"; }
+ISSUES=0
+
+hdr "System"
+echo "  $(hostname) — $(uname -r) — up $(uptime -p 2>/dev/null | sed 's/^up //')"
+if [[ -f /var/run/reboot-required ]]; then bad "Reboot required (kernel/libc updated)"; ISSUES=$((ISSUES+1)); else ok "No reboot pending"; fi
+ignore_re='^$'
+if [[ -s /etc/starhard/ignore-units ]]; then
+    ignore_re="^($(grep -Ev '^\s*(#|$)' /etc/starhard/ignore-units | sed 's/\.service$//' | paste -sd'|'))(\.service)?$"
+fi
+failed="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -Ev "$ignore_re" | tr '\n' ' ')"
+if [[ -n "$failed" ]]; then bad "Failed services: $failed"; ISSUES=$((ISSUES+1)); else ok "No failed services"; fi
+
+hdr "Updates"
+if command -v apt-get >/dev/null 2>&1; then
+    sec="$(apt-get -s upgrade 2>/dev/null | grep -ci '^inst.*securi' || true)"
+    all="$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst' || true)"
+    if [[ "${sec:-0}" -gt 0 ]]; then bad "$sec security update(s) pending ($all total) — run: apt full-upgrade"; ISSUES=$((ISSUES+1))
+    elif [[ "${all:-0}" -gt 0 ]]; then note "$all package update(s) pending (none security)"
+    else ok "System up to date"; fi
+    last="$(grep -h 'Packages that were upgraded' /var/log/unattended-upgrades/unattended-upgrades.log 2>/dev/null | tail -1 | cut -c1-19)"
+    [[ -n "$last" ]] && note "Last unattended-upgrade: $last"
+elif command -v dnf >/dev/null 2>&1; then
+    n="$(dnf -q updateinfo list --security 2>/dev/null | grep -c . || true)"
+    if [[ "${n:-0}" -gt 0 ]]; then bad "$n security update(s) pending"; ISSUES=$((ISSUES+1)); else ok "No security updates pending"; fi
+fi
+command -v pihole >/dev/null 2>&1 && note "Pi-hole: $(pihole -v 2>/dev/null | head -1 | sed 's/^ *//')  (update with: pihole -up)"
+
+hdr "Malware scan (ClamAV / unhide / integrity) — last $DAYS days"
+scanlog="$(ls -t /var/log/starhard/scan-*.log 2>/dev/null | head -1)"
+if [[ -z "$scanlog" ]]; then
+    note "No scan has run yet — run: starhard-scan   (timer: $(systemctl list-timers starhard-scan.timer --no-legend 2>/dev/null | awk '{print $1" "$2" "$3}'))"
+else
+    age=$(( ( $(date +%s) - $(stat -c %Y "$scanlog") ) / 86400 ))
+    note "Last scan: $(basename "$scanlog" .log | sed 's/scan-//') (${age}d ago)"
+    inf="$(grep -m1 '^Infected files:' "$scanlog" | awk '{print $3}')"
+    if [[ -z "$inf" ]]; then
+        if pgrep -x clamscan >/dev/null 2>&1; then
+            secs="$(ps -o etimes= -C clamscan 2>/dev/null | head -1 | xargs)"
+            note "ClamAV: scan in progress ($(( ${secs:-0} / 60 )) min elapsed)"
+        elif grep -q 'SKIPPED: only' "$scanlog"; then note "ClamAV skipped last run (low memory)"
+        else note "ClamAV: no result in log (scan interrupted?)"; fi
+    elif [[ "$inf" == "0" ]]; then ok "ClamAV: 0 infected files"
+    else bad "ClamAV: $inf infected file(s):"; grep ' FOUND$' "$scanlog" | sed 's/^/        /'; ISSUES=$((ISSUES+1)); fi
+    if grep -q 'Found HIDDEN' "$scanlog"; then bad "unhide: HIDDEN process/port reported — see $scanlog"; ISSUES=$((ISSUES+1))
+    elif grep -q 'unhide' "$scanlog"; then ok "unhide: no hidden processes"; fi
+    chg="$(sed -n '/-- package integrity --/,/-- lynis --/p' "$scanlog" | grep -Ev '^--|^$|^Full report' | grep -c . || true)"
+    if [[ "${chg:-0}" -gt 0 ]]; then note "Package integrity: $chg modified file(s) — see $scanlog (config edits are normal)"
+    else ok "Package integrity: no modified package files"; fi
+fi
+db="$(ls -t /var/lib/clamav/daily.c[lv]d 2>/dev/null | head -1)"
+if [[ -n "$db" ]]; then
+    dage=$(( ( $(date +%s) - $(stat -c %Y "$db") ) / 86400 ))
+    if [[ $dage -gt 3 ]]; then bad "ClamAV signatures are ${dage}d old — check: systemctl status clamav-freshclam"; ISSUES=$((ISSUES+1)); else ok "ClamAV signatures current (${dage}d)"; fi
+fi
+
+hdr "File integrity (AIDE)"
+aidelog="$(ls -t /var/log/starhard/aide-*.log /var/log/aide/aide.log 2>/dev/null | head -1)"
+aidedb="$(ls -t /var/lib/aide/aide.db /var/lib/aide/aide.db.gz 2>/dev/null | head -1)"
+if [[ -z "$aidelog" ]]; then
+    note "No AIDE check log yet (runs daily)"
+elif [[ -n "$aidedb" && "$aidedb" -nt "$aidelog" ]]; then
+    ok "Baseline rebuilt $(( ( $(date +%s) - $(stat -c %Y "$aidedb") ) / 3600 ))h ago — newer than the last check; next daily check will report against it"
+else
+    aage=$(( ( $(date +%s) - $(stat -c %Y "$aidelog") ) / 86400 ))
+    if grep -q 'found NO differences\|AIDE found no differences' "$aidelog" 2>/dev/null; then
+        ok "Last check (${aage}d ago): no changes"
+    else
+        a="$(grep -m1 -E '^ *Added entries:' "$aidelog" | awk '{print $NF}')"
+        r="$(grep -m1 -E '^ *Removed entries:' "$aidelog" | awk '{print $NF}')"
+        c="$(grep -m1 -E '^ *Changed entries:' "$aidelog" | awk '{print $NF}')"
+        if [[ -n "$a$r$c" ]]; then
+            if [[ "${a:-0}" -gt 5000 || "${r:-0}" -gt 5000 ]]; then
+                bad "AIDE baseline is stale (added ${a:-0}, removed ${r:-0}) — reports are noise until you rebuild: aideinit --yes --force"; ISSUES=$((ISSUES+1))
+            else
+                note "Last check (${aage}d ago): added ${a:-0}, removed ${r:-0}, changed ${c:-0} — $aidelog"
+            fi
+            crit="$(grep -E '^(changed|f[^ ]*):? */(etc/(passwd|shadow|sudoers|ssh)|usr/(s?bin)/|usr/local/s?bin/)' "$aidelog" | head -5)"
+            if [[ -n "$crit" ]]; then bad "Changes in sensitive paths:"; echo "$crit" | sed 's/^/        /'; ISSUES=$((ISSUES+1)); fi
+            note "After a legitimate upgrade, refresh the baseline: aideinit --yes --force"
+        else
+            note "Last check (${aage}d ago): see $aidelog"
+        fi
+    fi
+fi
+
+hdr "Audit trail (auditd) — last $DAYS days"
+if command -v ausearch >/dev/null 2>&1 && systemctl is-active -q auditd 2>/dev/null; then
+    since="$(date -d "$DAYS days ago" '+%m/%d/%Y' 2>/dev/null || echo recent)"
+    cnt() { ausearch -k "$1" -ts "$since" 2>/dev/null | grep -c '^type=SYSCALL\|^type=PATH' ; }
+    for k in identity scope modules pi_boot sshd sudo_log preload input_dev; do
+        n="$(cnt "$k")"
+        [[ "${n:-0}" -gt 0 ]] && note "$k: $n event(s)   → ausearch -k $k -ts $since -i | less"
+    done
+    fl="$(ausearch -m USER_LOGIN -ts "$since" 2>/dev/null | grep -c 'res=failed' || true)"
+    if [[ "${fl:-0}" -gt 20 ]]; then bad "$fl failed logins"; ISSUES=$((ISSUES+1)); elif [[ "${fl:-0}" -gt 0 ]]; then note "$fl failed login(s)"; else ok "No failed logins"; fi
+    ok "auditd running"
+else
+    bad "auditd not running"; ISSUES=$((ISSUES+1))
+fi
+
+hdr "Keylogger indicators"
+# 1. Library preload hooks
+if [[ -s /etc/ld.so.preload ]]; then
+    bad "/etc/ld.so.preload exists and is not empty — every process loads these libraries:"; sed 's/^/        /' /etc/ld.so.preload; ISSUES=$((ISSUES+1))
+else
+    ok "No /etc/ld.so.preload"
+fi
+pre="$(grep -ls 'LD_PRELOAD' /etc/environment /etc/profile /etc/profile.d/* /etc/bash.bashrc /etc/zsh/zshenv 2>/dev/null | tr '\n' ' ')"
+[[ -n "$pre" ]] && { bad "LD_PRELOAD set system-wide in: $pre"; ISSUES=$((ISSUES+1)); }
+# 2. Who holds the input devices right now
+known='^(Xorg|Xwayland|weston|wayfire|labwc|sway|hyprland|kwin_wayland|gnome-shell|mutter|cage|cosmic-comp|river|niri|systemd-logind|upowerd|acpid|thd|triggerhappy|kodi|kodi\.bin|steam|steamwebhelper|gamescope|retroarch|lightdm|sddm|gdm|gdm-wayland-ses|pipewire|wireplumber)$'
+holders="$(for fd in /proc/[0-9]*/fd/*; do
+    t="$(readlink "$fd" 2>/dev/null)" || continue
+    [[ "$t" == /dev/input/* ]] || continue
+    pid="${fd#/proc/}"; pid="${pid%%/*}"
+    echo "$pid"
+done | sort -un)"
+if [[ -z "$holders" ]]; then
+    ok "No process currently holds an input device"
+else
+    while read -r pid; do
+        comm="$(tr -d '\0' < "/proc/$pid/comm" 2>/dev/null)"
+        exe="$(readlink "/proc/$pid/exe" 2>/dev/null || echo '?')"
+        usr="$(stat -c %U "/proc/$pid" 2>/dev/null)"
+        if [[ "$exe" == *"(deleted)"* ]]; then
+            bad "PID $pid ($comm, $usr) holds input devices from a DELETED binary: $exe"; ISSUES=$((ISSUES+1))
+        elif [[ "$exe" == /tmp/* || "$exe" == /var/tmp/* || "$exe" == /dev/shm/* || "$exe" == /home/* || "$exe" == /root/* ]]; then
+            bad "PID $pid ($comm, $usr) holds input devices, running from $exe"; ISSUES=$((ISSUES+1))
+        elif [[ "$comm" =~ $known ]]; then
+            ok "$comm (PID $pid, $usr) — expected to read input"
+        else
+            note "$comm (PID $pid, $usr) reads input devices — $exe   (unfamiliar? ps -fp $pid)"
+        fi
+    done <<< "$holders"
+fi
+# 3. Display server: on X11 any process on the display can sniff keys (XRecord), undetectably
+xs="$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}' | while read -r sid; do loginctl show-session "$sid" -p Type --value 2>/dev/null; done | grep -c '^x11$')"
+if [[ "${xs:-0}" -gt 0 ]]; then note "X11 session active: any process on the display can read keystrokes — Wayland closes this"
+else ok "No X11 session (Wayland/console only)"; fi
+
+hdr "USB devices"
+if command -v usbguard >/dev/null 2>&1 && systemctl is-active -q usbguard 2>/dev/null; then
+    mode="$(grep -m1 '^ImplicitPolicyTarget=' /etc/usbguard/usbguard-daemon.conf 2>/dev/null | cut -d= -f2)"
+    ok "USBGuard running (unknown devices: ${mode:-?})"
+    # Current devices; flag HID (03) / network (02, e0) class devices that have no allow rule
+    usbguard list-devices 2>/dev/null | while IFS= read -r line; do
+        id="${line%%:*}"; state="$(echo "$line" | awk '{print $2}')"
+        name="$(echo "$line" | grep -o 'name "[^"]*"' | cut -d'"' -f2)"
+        vid="$(echo "$line" | grep -o 'id [0-9a-f:]*' | cut -d' ' -f2)"
+        ifs="$(echo "$line" | grep -o 'with-interface {[^}]*}\|with-interface [0-9a-f:]*' | head -1)"
+        serial="$(echo "$line" | grep -o 'serial "[^"]*"' | cut -d'"' -f2)"
+        cls=""
+        echo "$ifs" | grep -q '03:' && cls="HID"
+        echo "$ifs" | grep -Eq '(02|e0):' && cls="${cls:+$cls+}NET"
+        if [[ "$state" == "block" || "$state" == "reject" ]]; then
+            bad "BLOCKED  [$id] $vid ${name:-?} ${cls:+($cls)} — allow with: starhard-usb-allow $id"; ISSUES=$((ISSUES+1))
+        elif [[ -n "$cls" ]] && ! grep -q "serial \"$serial\"" /etc/usbguard/rules.conf 2>/dev/null && ! grep -q "id $vid" /etc/usbguard/rules.conf 2>/dev/null; then
+            note "allowed  [$id] $vid ${name:-?} ($cls) — not in the policy file (plugged in since setup)"
+        else
+            echo "          [$id] $vid ${name:-?}${cls:+ ($cls)}"
+        fi
+    done
+    # Attach / block events this week
+    if command -v ausearch >/dev/null 2>&1; then
+        since="$(date -d "$DAYS days ago" '+%m/%d/%Y' 2>/dev/null)"
+        ev="$(ausearch -m USER_DEVICE -ts "$since" 2>/dev/null | grep -c 'op=insert' || true)"
+        bl="$(ausearch -m USER_DEVICE -ts "$since" 2>/dev/null | grep -c 'target=block\|target=reject' || true)"
+        if [[ "${bl:-0}" -gt 0 ]]; then note "$ev USB attach event(s), $bl blocked   → ausearch -m USER_DEVICE -ts $since -i | grep -i block"
+        elif [[ "${ev:-0}" -gt 0 ]]; then note "$ev USB attach event(s), none blocked   → ausearch -m USER_DEVICE -ts $since -i"
+        else ok "No USB attach events in $DAYS days"; fi
+    fi
+    if systemctl is-enabled -q starhard-usb-lock.service 2>/dev/null && ! systemctl is-active -q starhard-usb-lock.service 2>/dev/null; then
+        bad "lock-screen USB watcher not running"; ISSUES=$((ISSUES+1))
+    fi
+elif command -v usbguard >/dev/null 2>&1; then
+    bad "USBGuard installed but not running"; ISSUES=$((ISSUES+1))
+else
+    note "USBGuard not installed — run StarHard section 20"
+fi
+
+hdr "Intrusion prevention"
+if command -v cscli >/dev/null 2>&1 && systemctl is-active -q crowdsec 2>/dev/null; then
+    n="$(cscli decisions list -o raw 2>/dev/null | tail -n +2 | grep -c . || true)"
+    ok "CrowdSec running — $n active ban(s)   → cscli alerts list"
+    if ! cscli bouncers list -o raw 2>/dev/null | grep -qi firewall; then bad "CrowdSec has NO firewall bouncer registered — it detects but does not block"; ISSUES=$((ISSUES+1)); fi
+    if systemctl is-active -q fail2ban 2>/dev/null; then bad "fail2ban is ALSO running — two ban engines conflict; run: StarHard.sh --sections 8 --ids crowdsec"; ISSUES=$((ISSUES+1)); fi
+elif command -v fail2ban-client >/dev/null 2>&1 && systemctl is-active -q fail2ban 2>/dev/null; then
+    b="$(fail2ban-client status sshd 2>/dev/null | grep 'Currently banned' | awk '{print $NF}')"
+    t="$(fail2ban-client status sshd 2>/dev/null | grep 'Total banned' | awk '{print $NF}')"
+    ok "fail2ban running — sshd: ${b:-0} banned now, ${t:-0} total"
+else
+    bad "No intrusion prevention service running"; ISSUES=$((ISSUES+1))
+fi
+if command -v ufw >/dev/null 2>&1; then
+    ufw status 2>/dev/null | grep -q 'Status: active' && ok "ufw active" || { bad "ufw INACTIVE"; ISSUES=$((ISSUES+1)); }
+elif command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --state 2>/dev/null | grep -q running && ok "firewalld running" || { bad "firewalld not running"; ISSUES=$((ISSUES+1)); }
+fi
+
+hdr "Lynis"
+if [[ -f /var/lib/starhard/lynis-index ]]; then
+    read -r ts idx < <(tail -n1 /var/lib/starhard/lynis-index)
+    note "Hardening index $idx/100 (run $ts)   → starhard.sh --audit for a fresh one"
+fi
+
+echo
+if [[ $ISSUES -eq 0 ]]; then echo -e "${G}Nothing needs attention.${N}"; else echo -e "${R}$ISSUES item(s) need attention.${N}"; fi
