@@ -57,6 +57,15 @@
 #     step; starhard-status lists attached devices, flags HID/network devices
 #     not in the policy, and shows the week's attach/block events. Weekly
 #     ClamAV scan now includes anything mounted under /media or /mnt.
+#   * ClamAV exclusions: /etc/starhard/clamav-exclude (one regex per line).
+#     Pentest distros (Parrot/Kali) get defaults for directories that contain
+#     exploit code or scanner payloads by design — unicornscan, Metasploit,
+#     exploitdb, Suricata/Snort rules, wordlists — so the weekly scan stops
+#     flagging the tools themselves. Status shows how many paths were skipped.
+#   * apt-listbugs aware: serious bugs for a package are shown as info, then
+#     the install proceeds (Parrot's listbugs otherwise aborts non-interactive
+#     installs). USBGuard rules live in rules.d/ so a buggy postinst that
+#     regenerates rules.conf can't erase them; daemon IPC restricted to root.
 #   * Keylogger indicators: auditd watches /etc/ld.so.preload and logs
 #     user-initiated opens of /dev/input/ (keys preload, input_dev);
 #     starhard-status lists processes holding input devices, flags any
@@ -404,7 +413,22 @@ pkg_install() {
     for p in "$@"; do
         was=1; pkg_installed "$p" && was=0
         case "$PKG" in
-            apt)    run "install $p" env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$p" ;;
+            apt)
+                if command -v apt-listbugs >/dev/null 2>&1 && [[ $DRY_RUN -eq 0 ]]; then
+                    local bugs
+                    bugs="$(APT_LISTBUGS_FRONTEND=none apt-listbugs -s serious list "$p" 2>/dev/null | grep -E '^ *b[0-9]+ - #' | sed 's/^ *//' | head -3)"
+                    [[ -n "$bugs" ]] && info "apt-listbugs: $p has open serious bug(s) — installing anyway:" && echo "$bugs" | sed 's/^/      /'
+                fi
+                # A previously aborted install may have left a -30000 pin from apt-listbugs, which makes apt
+                # report "no installation candidate". Lift it for this package before trying.
+                if [[ $DRY_RUN -eq 0 && -f /etc/apt/preferences.d/apt-listbugs ]] && grep -qx "Package: $p" /etc/apt/preferences.d/apt-listbugs; then
+                    backup_file /etc/apt/preferences.d/apt-listbugs
+                    # drop the stanza (Explanation..Pin-Priority block) that names this package
+                    awk -v pkg="$p" 'BEGIN{RS="";ORS="\n\n"} $0 !~ ("\nPackage: " pkg "\n")' /etc/apt/preferences.d/apt-listbugs > /tmp/.sh-listbugs.$$ \
+                        && cat /tmp/.sh-listbugs.$$ > /etc/apt/preferences.d/apt-listbugs; rm -f /tmp/.sh-listbugs.$$
+                    info "apt-listbugs had pinned $p as uninstallable (left over from an aborted install) — pin removed"
+                fi
+                run "install $p" env DEBIAN_FRONTEND=noninteractive APT_LISTBUGS_FRONTEND=none apt-get install -y -qq "$p" ;;
             dnf)    run "install $p" dnf install -y -q "$p" ;;
             yum)    run "install $p" yum install -y -q "$p" ;;
             zypper) run "install $p" zypper -q install -y "$p" ;;
@@ -545,7 +569,9 @@ do_audit() {
     chk 15 "journald persistent"                      grep -rqs '^Storage=persistent' /etc/systemd/journald.conf.d/ /etc/systemd/journald.conf
     if command -v usbguard >/dev/null 2>&1; then
         chk 20 "usbguard running"                     svc_active usbguard
-        chk 20 "usbguard policy has StarHard rules"   grep -q '# StarHard' /etc/usbguard/rules.conf
+        chk 20 "usbguard StarHard rules in rules.d"   test -s /etc/usbguard/rules.d/50-starhard.conf
+        chk 20 "usbguard RuleFolder enabled"          grep -q '^RuleFolder=/etc/usbguard/rules.d' /etc/usbguard/usbguard-daemon.conf
+        chk 20 "usbguard IPC restricted to root"      grep -q '^IPCAllowedUsers=root' /etc/usbguard/usbguard-daemon.conf
         chk 20 "usbguard audit → auditd"              grep -q '^AuditBackend=LinuxAudit' /etc/usbguard/usbguard-daemon.conf
         [[ "$PROFILE" != "server" ]] && chk 20 "lock-screen HID block watcher running" svc_active starhard-usb-lock.service
         [[ "$PROFILE" == "server" ]] && chk 20 "usbguard implicit policy = block (server)" grep -q '^ImplicitPolicyTarget=block' /etc/usbguard/usbguard-daemon.conf
@@ -1503,8 +1529,18 @@ LOG="/var/log/starhard/scan-$(date +%F).log"
         for m in $(findmnt -rn -o TARGET 2>/dev/null | grep -E '^/(media|mnt|run/media)(/|$)'); do
             DIRS="$DIRS $m"; echo "including removable media: $m"
         done
+        # User/distro exclusions: /etc/starhard/clamav-exclude (one extended regex per line)
+        EXCL=""
+        if [ -s /etc/starhard/clamav-exclude ]; then
+            n=0
+            while IFS= read -r pat; do
+                case "$pat" in ''|\#*) continue;; esac
+                EXCL="$EXCL --exclude-dir=$pat --exclude=$pat"; n=$((n+1))
+            done < /etc/starhard/clamav-exclude
+            echo "exclusions applied: $n pattern(s) from /etc/starhard/clamav-exclude"
+        fi
         # shellcheck disable=SC2086
-        clamscan -r -i --exclude-dir='^/(proc|sys|dev|run)' $DIRS
+        clamscan -r -i --exclude-dir='^/(proc|sys|dev|run)' $EXCL $DIRS
         fi
     fi
 
@@ -1542,6 +1578,26 @@ EOF
         mkdir -p /etc/starhard
         record_rm /etc/starhard/ignore-units
         printf '# starhard-status: failed units to ignore, one per line (e.g. suricata, hostapd-wpe)\n' > /etc/starhard/ignore-units
+    fi
+    if [[ $DRY_RUN -eq 0 && ! -e /etc/starhard/clamav-exclude ]]; then
+        mkdir -p /etc/starhard
+        record_rm /etc/starhard/clamav-exclude
+        {
+            echo '# starhard-scan: paths ClamAV should skip, one extended regex per line (matched against the full path).'
+            echo '# Add directories that legitimately contain exploit code, scanner payloads or detection rules.'
+            case "$OS_ID" in
+                kali|parrot|blackarch)
+                    echo "# Defaults for $OS_ID — security tooling that ClamAV mistakes for malware:"
+                    printf '%s\n' '^/etc/unicornscan' '^/usr/share/unicornscan' '^/usr/share/metasploit-framework' \
+                        '^/usr/share/exploitdb' '^/usr/share/set' '^/usr/share/beef-xss' '^/usr/share/webshells' \
+                        '^/usr/share/windows-resources' '^/usr/share/wordlists' '^/usr/share/seclists' \
+                        '^/usr/share/nmap/scripts' '^/usr/share/sqlmap' '^/usr/share/responder' \
+                        '^/etc/suricata/rules' '^/var/lib/suricata' '^/etc/snort' '^/usr/share/doc/suricata' \
+                        '^/opt/metasploit' '^/root/\.msf' '/\.msf4/' ;;
+                *) echo '# (none by default on this distro)' ;;
+            esac
+        } > /etc/starhard/clamav-exclude
+        [[ "$OS_ID" =~ ^(kali|parrot|blackarch)$ ]] && info "ClamAV: pentest-tool directories excluded from the weekly scan (edit /etc/starhard/clamav-exclude)"
     fi
 
 
@@ -1600,7 +1656,9 @@ else
             note "ClamAV: scan in progress ($(( ${secs:-0} / 60 )) min elapsed)"
         elif grep -q 'SKIPPED: only' "$scanlog"; then note "ClamAV skipped last run (low memory)"
         else note "ClamAV: no result in log (scan interrupted?)"; fi
-    elif [[ "$inf" == "0" ]]; then ok "ClamAV: 0 infected files"
+    elif [[ "$inf" == "0" ]]; then
+        ex="$(grep -m1 -o 'exclusions applied: [0-9]*' "$scanlog" | awk '{print $3}')"
+        ok "ClamAV: 0 infected files${ex:+ (${ex} path pattern(s) excluded — /etc/starhard/clamav-exclude)}"
     else bad "ClamAV: $inf infected file(s):"; grep ' FOUND$' "$scanlog" | sed 's/^/        /'; ISSUES=$((ISSUES+1)); fi
     if grep -q 'Found HIDDEN' "$scanlog"; then bad "unhide: HIDDEN process/port reported — see $scanlog"; ISSUES=$((ISSUES+1))
     elif grep -q 'unhide' "$scanlog"; then ok "unhide: no hidden processes"; fi
@@ -1669,7 +1727,7 @@ fi
 pre="$(grep -ls 'LD_PRELOAD' /etc/environment /etc/profile /etc/profile.d/* /etc/bash.bashrc /etc/zsh/zshenv 2>/dev/null | tr '\n' ' ')"
 [[ -n "$pre" ]] && { bad "LD_PRELOAD set system-wide in: $pre"; ISSUES=$((ISSUES+1)); }
 # 2. Who holds the input devices right now
-known='^(Xorg|Xwayland|weston|wayfire|labwc|sway|hyprland|kwin_wayland|gnome-shell|mutter|cage|cosmic-comp|river|niri|systemd-logind|upowerd|acpid|thd|triggerhappy|kodi|kodi\.bin|steam|steamwebhelper|gamescope|retroarch|lightdm|sddm|gdm|gdm-wayland-ses|pipewire|wireplumber)$'
+known='^(systemd|Xorg|Xwayland|weston|wayfire|labwc|sway|hyprland|kwin_wayland|gnome-shell|mutter|cage|cosmic-comp|river|niri|systemd-logind|upowerd|acpid|thd|triggerhappy|kodi|kodi\.bin|steam|steamwebhelper|gamescope|retroarch|lightdm|sddm|gdm|gdm-wayland-ses|pipewire|wireplumber)$'
 holders="$(for fd in /proc/[0-9]*/fd/*; do
     t="$(readlink "$fd" 2>/dev/null)" || continue
     [[ "$t" == /dev/input/* ]] || continue
@@ -1710,12 +1768,17 @@ if command -v usbguard >/dev/null 2>&1 && systemctl is-active -q usbguard 2>/dev
         vid="$(echo "$line" | grep -o 'id [0-9a-f:]*' | cut -d' ' -f2)"
         ifs="$(echo "$line" | grep -o 'with-interface {[^}]*}\|with-interface [0-9a-f:]*' | head -1)"
         serial="$(echo "$line" | grep -o 'serial "[^"]*"' | cut -d'"' -f2)"
+        # interface codes are cc:ss:pp tokens; classify on the whole token, not a substring
+        toks="$(echo "$ifs" | grep -oE '\b[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}\b')"
         cls=""
-        echo "$ifs" | grep -q '03:' && cls="HID"
-        echo "$ifs" | grep -Eq '(02|e0):' && cls="${cls:+$cls+}NET"
+        echo "$toks" | grep -q '^03:' && cls="HID"
+        echo "$toks" | grep -Eq '^(02:06:|02:00:|e0:01:03|ef:04:01)' && cls="${cls:+$cls+}NET"
+        echo "$toks" | grep -q '^e0:01:01' && cls="${cls:+$cls+}BT"
+        echo "$toks" | grep -q '^08:' && cls="${cls:+$cls+}STORAGE"
+        [[ -z "$name" ]] && name="(no name)"
         if [[ "$state" == "block" || "$state" == "reject" ]]; then
             bad "BLOCKED  [$id] $vid ${name:-?} ${cls:+($cls)} — allow with: starhard-usb-allow $id"; ISSUES=$((ISSUES+1))
-        elif [[ -n "$cls" ]] && ! grep -q "serial \"$serial\"" /etc/usbguard/rules.conf 2>/dev/null && ! grep -q "id $vid" /etc/usbguard/rules.conf 2>/dev/null; then
+        elif [[ "$cls" == *HID* || "$cls" == *NET* ]] && ! grep -q "serial \"$serial\"" /etc/usbguard/rules.conf 2>/dev/null && ! grep -q "id $vid" /etc/usbguard/rules.conf 2>/dev/null; then
             note "allowed  [$id] $vid ${name:-?} ($cls) — not in the policy file (plugged in since setup)"
         else
             echo "          [$id] $vid ${name:-?}${cls:+ ($cls)}"
@@ -2353,13 +2416,21 @@ sec_pi() {
 # 20. USB device control (USBGuard) — every profile
 #===============================================================================
 sec_usb() {
-    if ! command -v usbguard >/dev/null 2>&1; then
-        info "usbguard not installed (no package for $PKG?) — skipping"
-        return 0
-    fi
     if ! has_systemd; then info "USBGuard setup requires systemd — skipping"; return 0; fi
+    if ! command -v usbguard >/dev/null 2>&1; then
+        if [[ "$PKG" == "apk" ]]; then info "usbguard is not packaged for Alpine — skipping"; return 0; fi
+        info "usbguard not installed — installing"
+        pkg_install usbguard
+        if [[ $DRY_RUN -eq 0 ]] && ! command -v usbguard >/dev/null 2>&1; then
+            warn "usbguard failed to install (see $LOG_FILE) — skipping USB device control"
+            return 0
+        fi
+        # Fresh install: the package may auto-start with an empty policy. Stop it until our policy is in place.
+        [[ $DRY_RUN -eq 0 ]] && systemctl stop usbguard >/dev/null 2>&1 || true
+    fi
 
     local rules=/etc/usbguard/rules.conf conf=/etc/usbguard/usbguard-daemon.conf
+    local rulesd=/etc/usbguard/rules.d sh_rules=/etc/usbguard/rules.d/50-starhard.conf
 
     # Base policy: everything attached right now is allowed. Never regenerate an existing policy.
     if [[ ! -s "$rules" ]]; then
@@ -2375,27 +2446,30 @@ sec_usb() {
         info "USBGuard policy already exists ($(grep -c '^allow' "$rules" 2>/dev/null || echo '?') allow rules) — keeping it"
     fi
 
-    # StarHard rules appended once, after the device allow-list so known devices always win.
-    if [[ $DRY_RUN -eq 0 ]] && ! grep -q '# StarHard' "$rules" 2>/dev/null; then
+    # StarHard rules live in rules.d/ (usbguard RuleFolder), read AFTER rules.conf so the device
+    # allow-list always wins. Kept separate because usbguard <1.1.4's postinst regenerates rules.conf
+    # on upgrade (Debian #1134796) and would otherwise erase these.
+    [[ -d "$rulesd" ]] || { [[ $DRY_RUN -eq 0 ]] && mkdir -p "$rulesd" && chmod 700 "$rulesd"; }
+    # Migrate rules a previous StarHard run appended to rules.conf
+    if [[ $DRY_RUN -eq 0 && -f "$rules" ]] && grep -q '# StarHard' "$rules"; then
         backup_file "$rules"
-        if [[ "$PROFILE" == "server" ]]; then
-            cat >> "$rules" <<'EOF'
-
-# StarHard (server): anything not listed above is blocked. Authorise with: starhard-usb-allow <id>
+        sed -i '/^# StarHard/,$d' "$rules"
+        info "USBGuard: moved StarHard rules out of rules.conf into $sh_rules"
+    fi
+    if [[ "$PROFILE" == "server" ]]; then
+        write_file "$sh_rules" 600 <<'EOF'
+# StarHard (server): anything not in rules.conf is blocked. Authorise with: starhard-usb-allow <id>
 block
 EOF
-        else
-            cat >> "$rules" <<'EOF'
-
-# StarHard (desktop): known devices allowed above. Two hard blocks regardless of lock state:
+    else
+        write_file "$sh_rules" 600 <<'EOF'
+# StarHard (desktop): known devices are allowed by rules.conf. Two hard blocks regardless of lock state:
 #  - a device that presents as a network adapter (PoisonTap / rogue USB-Ethernet)
 #  - a hub that also carries a HID interface (common in keystroke-injector cables)
 block with-interface one-of { 02:06:00 02:00:00 e0:01:03 ef:04:01 }
 block with-interface all-of { 09:00:00 03:00:00 }
-# Keyboards / HID that appear later are handled by the lock-screen rule set (see usbguard-lock)
+# New keyboards/HID while the screen is locked are handled by starhard-usb-lock.service
 EOF
-        fi
-        log "USBGuard: StarHard rules appended ($PROFILE)"
     fi
 
     # Daemon config: desktop audits new devices (apply-policy but implicit target allow), server blocks.
@@ -2409,7 +2483,13 @@ EOF
             sed -i -E 's/^InsertedDevicePolicy=.*/InsertedDevicePolicy=apply-policy/' "$conf"
             sed -i -E 's/^AuditBackend=.*/AuditBackend=LinuxAudit/' "$conf"
             grep -q '^AuditBackend=' "$conf" || echo 'AuditBackend=LinuxAudit' >> "$conf"
-            log "USBGuard daemon: implicit target '$implicit', audit via auditd"
+            # Read our rules from rules.d/
+            if grep -q '^#*\s*RuleFolder=' "$conf"; then sed -i -E "s|^#*\s*RuleFolder=.*|RuleFolder=$rulesd/|" "$conf"; else echo "RuleFolder=$rulesd/" >> "$conf"; fi
+            # IPC: root only (Debian #1134751 — plugdev granted full control). starhard-usb-allow runs as root anyway.
+            sed -i -E 's/^IPCAllowedUsers=.*/IPCAllowedUsers=root/' "$conf"
+            grep -q '^IPCAllowedUsers=' "$conf" || echo 'IPCAllowedUsers=root' >> "$conf"
+            sed -i -E 's/^IPCAllowedGroups=.*/IPCAllowedGroups=/' "$conf"
+            log "USBGuard daemon: implicit target '$implicit', rules.d enabled, IPC root-only, audit via auditd"
         fi
     fi
 
