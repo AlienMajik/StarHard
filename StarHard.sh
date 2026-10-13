@@ -32,6 +32,36 @@
 #   * --ids crowdsec|fail2ban (section 8): CrowdSec + firewall bouncer from
 #     the official repo, default on server; fail2ban is stopped/disabled so
 #     the two never fight over bans. Desktop default stays fail2ban.
+#   * Raspberry Pi detection (Pi 5 and earlier): no-GRUB warning + encryption
+#     advice, auditd watches on config.txt/cmdline.txt, Raspberry Pi
+#     Foundation origin for unattended-upgrades (kernel/firmware/EEPROM),
+#     EEPROM bootloader update check, dtoverlay radio disable
+#     (--pi-disable-wifi / --pi-disable-bt, bt automatic on server profile),
+#     wifi never disabled when the box is reached over wlan, ClamAV scan
+#     skipped when free RAM is short (section 19)
+#   * Service awareness: Tailscale (tailscale0 trusted, UDP 41641 allowed,
+#     rp_filter loose, auto-updates from Tailscale's repo) and Pi-hole (DNS,
+#     web UI and DHCP allowed from LAN subnets + tailnet); other listening
+#     ports that the firewall would block are listed before enabling it.
+#     Pi-hole LAN rules are only added when Pi-hole's own query log shows LAN
+#     clients (override: --pihole-lan / --no-lan-dns); stale ufw allow rules
+#     for ports with no listener are flagged; existing rules are never removed.
+#     accept_ra is left alone when the box has a SLAAC IPv6 address.
+#   * starhard-status: /etc/starhard/ignore-units lists failed units to
+#     ignore (e.g. unconfigured pentest daemons on Parrot/Kali); the weekly
+#     scan holds off idle-suspend with systemd-inhibit so laptops finish it
+#   * Section 20 USB: USBGuard on every profile. Desktop = audit mode (log all
+#     attaches, block nothing) + two hard rules: new keyboards/HID while the
+#     screen is locked and any USB network adapter are blocked. Server = block
+#     all unknown devices. starhard-usb-allow <id> authorises a device in one
+#     step; starhard-status lists attached devices, flags HID/network devices
+#     not in the policy, and shows the week's attach/block events. Weekly
+#     ClamAV scan now includes anything mounted under /media or /mnt.
+#   * Keylogger indicators: auditd watches /etc/ld.so.preload and logs
+#     user-initiated opens of /dev/input/ (keys preload, input_dev);
+#     starhard-status lists processes holding input devices, flags any
+#     running from /tmp, /home, /dev/shm or a deleted binary, checks
+#     ld.so.preload / LD_PRELOAD and warns when an X11 session is active
 #   * Section 18: installs/verifies Lynis, runs a full audit, summarises
 #     warnings + suggestions, maps each to the StarHard section that covers
 #     it, and tracks the hardening index across runs (no blind auto-fixing)
@@ -56,8 +86,16 @@ EXCLUDE=""
 IDS=""
 NEW_PKGS=()
 ARCH="$(uname -m)"
+IS_PI=0; PI_MODEL=""; PI_BOOT=""
+PI_DISABLE_WIFI=0; PI_DISABLE_BT=0
+PIHOLE_LAN=""   # "" = auto-detect from query log, 1 = force LAN rules, 0 = never
 SSH_ACTIVE=0
 [[ -n "${SSH_CONNECTION:-}" ]] && SSH_ACTIVE=1
+HAS_TAILSCALE=0; HAS_PIHOLE=0
+command -v tailscale >/dev/null 2>&1 && HAS_TAILSCALE=1
+{ command -v pihole >/dev/null 2>&1 || command -v pihole-FTL >/dev/null 2>&1 || [[ -d /etc/pihole ]]; } && HAS_PIHOLE=1
+HAS_SLAAC=0
+ip -6 addr show scope global 2>/dev/null | grep -q dynamic && HAS_SLAAC=1
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 
@@ -215,7 +253,7 @@ section() {
     # section <number> <name> <function>
     local n="$1" name="$2" fn="$3"
     if ! should_run "$n"; then
-        info "Section $n ($name) skipped by --sections/--exclude"
+        [[ -z "$SECTIONS" ]] && info "Section $n ($name) skipped by --exclude"
         return 0
     fi
     echo
@@ -235,6 +273,11 @@ Usage: sudo $0 [options]
   --sections a,b,c      Run only these section numbers (see --help list below)
   --exclude a,b,c       Skip these section numbers
   --ids <i>             crowdsec or fail2ban for section 8 (default: crowdsec on server, fail2ban on desktop)
+  --pi-disable-wifi     Raspberry Pi: disable the on-board Wi-Fi radio (dtoverlay=disable-wifi)
+  --pi-disable-bt       Raspberry Pi: disable the on-board Bluetooth radio (automatic on server profile)
+  --pihole-lan          Pi-hole: always open DNS/web to LAN subnets
+  --no-lan-dns          Pi-hole: never open DNS/web to LAN subnets (e.g. Tailscale-only Pi-hole)
+                        (default: decided from Pi-hole's query log — LAN rules only if LAN clients query it)
   -y, --yes             Assume "yes" to optional prompts (non-interactive)
   -h, --help            This help
 
@@ -245,6 +288,8 @@ Sections:
    4 auth policy        10 AIDE + timer         16 cleanup
    5 core dumps         11 malware/rootkit scan 17 GRUB password (interactive)
    6 SSH                12 automatic updates    18 Lynis audit + report analysis
+                                               19 Raspberry Pi (auto-detected)
+                                               20 USB device control (USBGuard)
 EOF
     exit 0
 }
@@ -257,6 +302,10 @@ while [[ $# -gt 0 ]]; do
         --sections) SECTIONS="${2:-}"; shift ;;
         --exclude)  EXCLUDE="${2:-}"; shift ;;
         --ids)      IDS="${2:-}"; shift ;;
+        --pi-disable-wifi) PI_DISABLE_WIFI=1 ;;
+        --pi-disable-bt)   PI_DISABLE_BT=1 ;;
+        --pihole-lan)      PIHOLE_LAN=1 ;;
+        --no-lan-dns)      PIHOLE_LAN=0 ;;
         -y|--yes)   ASSUME_YES=1 ;;
         -h|--help)  usage ;;
         *) err "Unknown option: $1"; usage ;;
@@ -298,6 +347,18 @@ if [[ -r /etc/os-release ]]; then
 fi
 
 is_family() { [[ "$OS_ID" == "$1" || " $OS_LIKE " == *" $1 "* ]]; }
+
+# Raspberry Pi detection
+if [[ -r /proc/device-tree/model ]]; then
+    PI_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)"
+    [[ "$PI_MODEL" == *"Raspberry Pi"* ]] && IS_PI=1
+fi
+if [[ $IS_PI -eq 1 ]]; then
+    if [[ -f /boot/firmware/config.txt ]]; then PI_BOOT=/boot/firmware
+    elif [[ -f /boot/config.txt ]]; then PI_BOOT=/boot
+    fi
+    [[ "$PROFILE" == "server" ]] && PI_DISABLE_BT=1
+fi
 
 if command -v apt-get >/dev/null 2>&1 && (is_family debian || is_family ubuntu); then
     PKG="apt"
@@ -442,6 +503,20 @@ do_audit() {
         fi
     fi
     chk 7  "firewall active"                          fw_active
+    if [[ $HAS_TAILSCALE -eq 1 ]] && command -v ufw >/dev/null 2>&1; then
+        chk 7 "tailscale0 allowed through ufw"        bash -c 'ufw status 2>/dev/null | grep -q "on tailscale0"'
+    fi
+    if [[ $HAS_PIHOLE -eq 1 ]] && command -v ufw >/dev/null 2>&1; then
+        if [[ "$PIHOLE_LAN" == "1" ]] || { [[ "$PIHOLE_LAN" != "0" ]] && pihole_has_lan_clients; }; then
+            chk 7 "Pi-hole DNS (53) allowed from LAN"  bash -c 'ufw status 2>/dev/null | grep -Eq "^53(/(tcp|udp))? "'
+        elif [[ $HAS_TAILSCALE -eq 1 ]]; then
+            chk 7 "Pi-hole reachable over tailnet (100.64.0.0/10 or tailscale0 allowed)" bash -c 'ufw status 2>/dev/null | grep -Eq "100\.64\.0\.0/10|on tailscale0"'
+            chk 7 "Pi-hole DNS NOT exposed to LAN (tailnet-only setup)" bash -c '! ufw status 2>/dev/null | grep -Eq "^53(/(tcp|udp))? .*(Anywhere|192\.168|10\.|172\.)"'
+        fi
+    fi
+    if [[ $HAS_TAILSCALE -eq 1 ]]; then
+        chk 2 "rp_filter loose (2) for Tailscale"     sysctl_is net.ipv4.conf.all.rp_filter 2
+    fi
     if [[ "$IDS" == "crowdsec" ]]; then
         chk 8 "crowdsec running"                      svc_active crowdsec
         chk 8 "crowdsec firewall bouncer running"     svc_active crowdsec-firewall-bouncer
@@ -453,11 +528,12 @@ do_audit() {
     fi
     chk 9  "auditd running"                           svc_active auditd
     chk 9  "audit rules loaded (>=10)"                audit_rules_loaded
-    chk 10 "AIDE database exists"                     bash -c 'ls /var/lib/aide/aide.db /var/lib/aide/aide.db.gz >/dev/null 2>&1'
+    chk 10 "AIDE database exists"                     bash -c '[[ -f /var/lib/aide/aide.db || -f /var/lib/aide/aide.db.gz ]]'
     chk 10 "AIDE check scheduled"                     aide_scheduled
     chk 11 "lynis + clamav installed"                 scanner_present
     chk 11 "ClamAV signature database present"        clam_db
     chk 11 "weekly starhard-scan timer active"        svc_active starhard-scan.timer
+    chk 11 "starhard-status installed"                test -x /usr/local/sbin/starhard-status
     chk 12 "automatic security updates configured"    autoupd_cfg
     chk 13 "/etc/shadow not other-readable"           not_other_readable /etc/shadow
     chk 13 "/etc/gshadow not other-readable"          not_other_readable /etc/gshadow
@@ -467,9 +543,28 @@ do_audit() {
     chk 15 "ctrl-alt-del masked"                      bash -c 'systemctl is-enabled ctrl-alt-del.target 2>/dev/null | grep -q masked'
     chk 15 "/dev/shm mounted noexec"                  mount_has_opt /dev/shm noexec
     chk 15 "journald persistent"                      grep -rqs '^Storage=persistent' /etc/systemd/journald.conf.d/ /etc/systemd/journald.conf
+    if command -v usbguard >/dev/null 2>&1; then
+        chk 20 "usbguard running"                     svc_active usbguard
+        chk 20 "usbguard policy has StarHard rules"   grep -q '# StarHard' /etc/usbguard/rules.conf
+        chk 20 "usbguard audit → auditd"              grep -q '^AuditBackend=LinuxAudit' /etc/usbguard/usbguard-daemon.conf
+        [[ "$PROFILE" != "server" ]] && chk 20 "lock-screen HID block watcher running" svc_active starhard-usb-lock.service
+        [[ "$PROFILE" == "server" ]] && chk 20 "usbguard implicit policy = block (server)" grep -q '^ImplicitPolicyTarget=block' /etc/usbguard/usbguard-daemon.conf
+    fi
     if [[ "$PROFILE" == "server" ]]; then
         chk 15 "/tmp mounted noexec (server)"         mount_has_opt /tmp noexec
         chk 15 "avahi not running (server)"           bash -c '! systemctl is-active -q avahi-daemon 2>/dev/null'
+    fi
+    if [[ $IS_PI -eq 1 ]]; then
+        chk 19 "Pi: Raspberry Pi origin in unattended-upgrades" test -f /etc/apt/apt.conf.d/53starhard-raspberrypi
+        chk 19 "Pi: auditd watching $PI_BOOT/config.txt"       bash -c "grep -q '$PI_BOOT/config.txt' /etc/audit/rules.d/50-hardening.rules"
+        command -v rpi-eeprom-update >/dev/null 2>&1 && \
+        chk 19 "Pi: EEPROM bootloader up to date"             bash -c "! rpi-eeprom-update 2>/dev/null | grep -q 'UPDATE AVAILABLE'"
+        [[ $PI_DISABLE_BT -eq 1 && -n "$PI_BOOT" ]] && \
+        chk 19 "Pi: dtoverlay=disable-bt set"                 grep -Eq '^\s*dtoverlay=disable-bt' "$PI_BOOT/config.txt"
+        [[ $PI_DISABLE_WIFI -eq 1 && -n "$PI_BOOT" ]] && \
+        chk 19 "Pi: dtoverlay=disable-wifi set"               grep -Eq '^\s*dtoverlay=disable-wifi' "$PI_BOOT/config.txt"
+        [[ "$PROFILE" == "server" && -n "$PI_BOOT" ]] && \
+        chk 19 "Pi: serial console login disabled (server)"   bash -c "! grep -q 'console=serial0' '$PI_BOOT/cmdline.txt'"
     fi
     echo "==============================================================="
     echo "  PASS: $A_PASS   FAIL: $A_FAIL"
@@ -481,9 +576,11 @@ do_audit() {
 echo "==============================================================="
 echo "  StarHard v$VERSION"
 echo "  OS: $OS_ID   Package manager: $PKG   Profile: $PROFILE   Arch: $ARCH   IPS: $IDS"
+[[ $IS_PI -eq 1 ]] && echo "  Hardware: $PI_MODEL  (boot config: ${PI_BOOT:-not found})"
+[[ $HAS_TAILSCALE -eq 1 || $HAS_PIHOLE -eq 1 ]] && echo "  Services detected:$( [[ $HAS_TAILSCALE -eq 1 ]] && echo ' tailscale')$( [[ $HAS_PIHOLE -eq 1 ]] && echo ' pi-hole') — firewall/sysctl adjusted"
 [[ $DRY_RUN -eq 1 ]] && echo "  MODE: DRY RUN — no changes will be made"
 [[ $SSH_ACTIVE -eq 1 ]] && echo "  Running over SSH — SSH access will be preserved in firewall rules"
-echo "  Backups: $BACKUP_DIR"
+[[ $AUDIT -eq 0 ]] && echo "  Backups: $BACKUP_DIR"
 echo "==============================================================="
 
 #===============================================================================
@@ -496,7 +593,7 @@ sec_packages() {
     [[ "$PKG" == "apt" && "$IDS" == "fail2ban" ]] && f2b+=(python3-systemd)
     case "$PKG" in
         apt)
-            [[ "$PROFILE" == "server" ]] && server_pkgs=(usbguard)
+            server_pkgs=(usbguard)
             pkg_install aide "${f2b[@]}" libpam-tmpdir needrestart \
                 apt-listchanges libpam-pwquality libpam-modules auditd audispd-plugins \
                 acct debsums unattended-upgrades apparmor apparmor-utils ufw \
@@ -507,18 +604,18 @@ sec_packages() {
                 pkg_installed epel-release || pkg_install epel-release
                 pkg_update
             fi
-            [[ "$PROFILE" == "server" ]] && server_pkgs=(usbguard)
+            server_pkgs=(usbguard)
             pkg_install aide "${f2b[@]}" audit psacct libpwquality firewalld \
                 dnf-automatic policycoreutils lynis clamav clamav-update unhide sudo \
                 "${server_pkgs[@]}"
             ;;
         zypper)
-            [[ "$PROFILE" == "server" ]] && server_pkgs=(usbguard)
+            server_pkgs=(usbguard)
             pkg_install aide "${f2b[@]}" audit acct pam_pwquality firewalld lynis clamav unhide sudo \
                 "${server_pkgs[@]}"
             ;;
         pacman)
-            [[ "$PROFILE" == "server" ]] && server_pkgs=(usbguard)
+            server_pkgs=(usbguard)
             pkg_install aide "${f2b[@]}" audit acct libpwquality ufw lynis clamav unhide sudo \
                 "${server_pkgs[@]}"
             ;;
@@ -533,7 +630,16 @@ sec_packages() {
 # 2. Kernel / sysctl hardening
 #===============================================================================
 sec_sysctl() {
-    write_file /etc/sysctl.d/99-hardening.conf 644 <<'EOF'
+    # rp_filter: strict (1) breaks Tailscale subnet routing/exit nodes; loose (2) keeps the anti-spoof benefit
+    local rpf=1 ra_block
+    [[ $HAS_TAILSCALE -eq 1 ]] && { rpf=2; info "Tailscale detected — rp_filter set to loose (2)"; }
+    if [[ $HAS_SLAAC -eq 1 ]]; then
+        ra_block="# accept_ra left at default: this host has a SLAAC IPv6 address and would lose it"
+        info "SLAAC IPv6 address present — leaving accept_ra unchanged"
+    else
+        ra_block=$'net.ipv6.conf.all.accept_ra = 0\nnet.ipv6.conf.default.accept_ra = 0'
+    fi
+    sed -e "s/__RPF__/$rpf/g" -e "s|__ACCEPT_RA__|${ra_block//$'\n'/\\n}|" <<'EOF' | write_file /etc/sysctl.d/99-hardening.conf 644
 # === Kernel ===
 dev.tty.ldisc_autoload = 0
 fs.protected_fifos = 2
@@ -565,8 +671,8 @@ net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.rp_filter = __RPF__
+net.ipv4.conf.default.rp_filter = __RPF__
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
@@ -577,8 +683,7 @@ net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_source_route = 0
 net.ipv6.conf.default.accept_source_route = 0
-net.ipv6.conf.all.accept_ra = 0
-net.ipv6.conf.default.accept_ra = 0
+__ACCEPT_RA__
 EOF
     # -e: keys unknown to this kernel are ignored instead of failing the whole run
     run "Apply sysctl settings" sysctl -e --system
@@ -588,8 +693,10 @@ EOF
 # 3. Blacklist rarely-used kernel modules
 #===============================================================================
 sec_modules() {
-    local mods=(dccp sctp rds tipc cramfs freevxfs jffs2 hfs hfsplus udf firewire-core)
-    [[ "$PROFILE" == "server" ]] && mods+=(bluetooth btusb)
+    local mods=(dccp sctp rds tipc cramfs freevxfs jffs2 hfs hfsplus udf)
+    # Firewire doesn't exist on a Pi; Bluetooth is cut at the device-tree level in section 19
+    [[ $IS_PI -eq 0 ]] && mods+=(firewire-core)
+    [[ "$PROFILE" == "server" && $IS_PI -eq 0 ]] && mods+=(bluetooth btusb)
     {
         echo "# StarHard — 'install' blocks explicit loading, 'blacklist' blocks autoloading"
         local m
@@ -613,10 +720,14 @@ sec_modules() {
 sec_auth() {
     if [[ -f /etc/login.defs ]]; then
         # Prefer yescrypt when libcrypt supports it (Debian 11+, Fedora, Arch, openSUSE TW)
-        local hash_block
-        local ys
+        local hash_block ys ys_ok=0
+        # Several signals: distro default in login.defs, PAM config, an existing $y$ hash, or a libcrypt probe
+        grep -Eq '^\s*ENCRYPT_METHOD\s+YESCRYPT' /etc/login.defs && ys_ok=1
+        grep -qs 'yescrypt' /etc/pam.d/common-password /etc/pam.d/system-auth /etc/pam.d/password-auth && ys_ok=1
+        cut -d: -f2 /etc/shadow 2>/dev/null | grep -q '^\$y\$' && ys_ok=1
         ys="$(perl -e 'print crypt("x","\$y\$j9T\$abcdefghijklmnopq\$")' 2>/dev/null || true)"
-        if [[ "$ys" == '$y$'* ]]; then
+        [[ "$ys" == '$y$'* ]] && ys_ok=1
+        if [[ $ys_ok -eq 1 ]]; then
             hash_block=$'ENCRYPT_METHOD  YESCRYPT\nYESCRYPT_COST_FACTOR 7'
             info "yescrypt supported — using ENCRYPT_METHOD YESCRYPT"
         else
@@ -770,8 +881,31 @@ sec_ssh() {
             warn "No authorized_keys found for any user — REFUSING to disable password authentication"
         fi
         profile_lines=$'MaxAuthTries 4\nMaxSessions 4\nAllowTcpForwarding no\nAllowAgentForwarding no'
+        [[ $HAS_PIHOLE -eq 1 ]] && info "Server profile disables SSH port-forwarding (ssh -L to the Pi-hole UI); reach it via LAN/Tailscale IP instead"
     else
         profile_lines=$'MaxAuthTries 6\nMaxSessions 10'
+    fi
+
+    # Crypto + extras, added only where this sshd supports the keyword (sshd -T lists every supported one)
+    local sshd_opts crypto_lines=""
+    sshd_opts="$(sshd -T 2>/dev/null | awk '{print tolower($1)}')"
+    has_opt() { grep -qx "$1" <<< "$sshd_opts"; }
+    if has_opt kexalgorithms; then
+        crypto_lines+=$'KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512\n'
+        crypto_lines+=$'Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr\n'
+        crypto_lines+=$'MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com\n'
+        crypto_lines+=$'HostKeyAlgorithms ssh-ed25519,ssh-ed25519-cert-v01@openssh.com,rsa-sha2-512,rsa-sha2-256,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com\n'
+    fi
+    has_opt requiredrsasize && crypto_lines+=$'RequiredRSASize 3072\n'
+    [[ "$PKG" == "apt" ]] && crypto_lines+=$'DebianBanner no\n'
+    # Restrict logins to real users who already have keys or a home dir (never lock out the invoking user)
+    local allow_users="" u
+    if [[ "$PROFILE" == "server" ]]; then
+        for u in $(awk -F: '$3>=1000 && $3<65534 && $7 !~ /(nologin|false)$/ {print $1}' /etc/passwd); do
+            [[ -s "/home/$u/.ssh/authorized_keys" ]] && allow_users+="$u "
+        done
+        [[ -n "${SUDO_USER:-}" && "$allow_users" != *"$SUDO_USER "* ]] && allow_users+="$SUDO_USER "
+        [[ -n "$allow_users" ]] && crypto_lines+="AllowUsers ${allow_users% }"$'\n' && info "SSH restricted to: ${allow_users% }"
     fi
 
     [[ $DRY_RUN -eq 0 ]] && mkdir -p /etc/ssh/sshd_config.d
@@ -790,6 +924,7 @@ UsePAM yes
 Banner /etc/issue.net
 $profile_lines
 $pw_line
+$crypto_lines
 EOF
 
     if [[ $DRY_RUN -eq 0 ]] && command -v sshd >/dev/null 2>&1; then
@@ -811,13 +946,110 @@ EOF
 #===============================================================================
 # 7. Firewall
 #===============================================================================
+pihole_has_lan_clients() {
+    # Looks at Pi-hole's query database for clients in the last 7 days that are NOT
+    # tailnet (100.64/10), loopback or the Pi itself. Returns 0 if any found.
+    local db=/etc/pihole/pihole-FTL.db sq=""
+    [[ -r "$db" ]] || return 1
+    if command -v pihole-FTL >/dev/null 2>&1; then sq="pihole-FTL sqlite3"
+    elif command -v sqlite3 >/dev/null 2>&1; then sq="sqlite3"
+    else return 1; fi
+    local clients
+    clients="$($sq "$db" "SELECT DISTINCT client FROM queries WHERE timestamp > strftime('%s','now')-604800;" 2>/dev/null)"
+    [[ -n "$clients" ]] || return 1
+    local my_ips c
+    my_ips="$(ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ')"
+    for c in $clients; do
+        case "$c" in
+            127.*|::1|100.6[4-9].*|100.[7-9]?.*|100.1[0-1]?.*|100.12[0-7].*|fd7a:115c:a1e0:*) continue ;;
+        esac
+        [[ " $my_ips " == *" $c "* ]] && continue
+        [[ "$c" == *:* ]] && continue   # ignore other IPv6 for this decision
+        return 0
+    done
+    return 1
+}
+
+fw_warn_stale_rules() {
+    # ufw "ALLOW IN" rules for a numeric port that nothing is listening on
+    command -v ufw >/dev/null 2>&1 || return 0
+    local listening stale="" rule port proto
+    listening="$(ss -tulnH 2>/dev/null | awk '{split($5,a,":"); print $1"/"a[length(a)]}' | sort -u)"
+    while read -r rule; do
+        port="${rule%%/*}"; proto="${rule#*/}"
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        case "$proto" in
+            tcp|udp) echo "$listening" | grep -qx "$proto/$port" || stale+=" $rule" ;;
+            *)       echo "$listening" | grep -Eq "^(tcp|udp)/$port$" || stale+=" $port" ;;
+        esac
+    done < <(ufw status 2>/dev/null | awk '/ALLOW IN/ && $1 !~ /^Anywhere/ {print $1}' | sed 's/ (v6)//' | sort -u)
+    if [[ -n "$stale" ]]; then
+        warn "ufw allows these ports but nothing is listening on them (stale? review with 'ufw status numbered'):$stale"
+    fi
+}
+
+fw_warn_listeners() {
+    # fw_warn_listeners <ssh_port> — show non-loopback listeners the default-deny policy will block
+    local ssh_port="$1" allowed=" $1 "
+    [[ $HAS_PIHOLE -eq 1 ]] && allowed+=" 53 80 443 67 "
+    [[ $HAS_TAILSCALE -eq 1 ]] && allowed+=" 41641 "
+    local others
+    others="$(ss -tulnH 2>/dev/null | awk '{split($5,a,":"); p=a[length(a)]; addr=$5; sub(":"p"$","",addr); if (addr !~ /^(127\.|\[::1\]|::1)/) print $1"/"p}' | sort -u \
+        | while read -r l; do p="${l#*/}"; [[ "$allowed" == *" $p "* ]] || echo "$l"; done | tr '\n' ' ')"
+    if [[ -n "$others" ]]; then
+        warn "Other listening ports that the firewall will now BLOCK from the network: $others"
+        warn "If any are needed, allow them: ufw allow <port>/<proto>  (or firewall-cmd --permanent --add-port=<port>/<proto>)"
+    fi
+}
+
 sec_firewall() {
     local ssh_port
     ssh_port="$(sshd_opt port)"; ssh_port="${ssh_port:-22}"
     local need_ssh=0
     [[ "$PROFILE" == "server" || $SSH_ACTIVE -eq 1 ]] && need_ssh=1
 
+    # LAN subnets (CIDR) of every non-loopback, non-tailscale interface with an IPv4 address
+    local lan_nets
+    lan_nets="$(ip -o -4 route show scope link 2>/dev/null | awk '$3 !~ /^(lo|tailscale|docker|br-|veth)/ {print $1}' | sort -u)"
+
+    # Pi-hole DHCP enabled?
+    local pihole_dhcp=0
+    if [[ $HAS_PIHOLE -eq 1 ]]; then
+        if command -v pihole-FTL >/dev/null 2>&1 && pihole-FTL --config dhcp.active 2>/dev/null | grep -qi true; then pihole_dhcp=1
+        elif grep -qs '^DHCP_ACTIVE=true' /etc/pihole/setupVars.conf; then pihole_dhcp=1
+        fi
+    fi
+
+    # Pi-hole: open to LAN only if LAN clients actually use it
+    local pihole_lan=0
+    if [[ $HAS_PIHOLE -eq 1 ]]; then
+        if [[ "$PIHOLE_LAN" == "1" ]]; then pihole_lan=1; info "Pi-hole: LAN rules forced on (--pihole-lan)"
+        elif [[ "$PIHOLE_LAN" == "0" ]]; then info "Pi-hole: LAN rules skipped (--no-lan-dns)"
+        elif pihole_has_lan_clients; then pihole_lan=1; info "Pi-hole: LAN clients seen in the query log — opening DNS/web to LAN subnets"
+        elif [[ $HAS_TAILSCALE -eq 1 ]]; then info "Pi-hole: only tailnet/local clients in the query log — NOT opening DNS to the LAN (use --pihole-lan to override)"
+        else pihole_lan=1; info "Pi-hole: no query history to judge from — opening DNS/web to LAN subnets (use --no-lan-dns to prevent)"
+        fi
+    fi
+
     if command -v ufw >/dev/null 2>&1; then
+        if ufw status 2>/dev/null | grep -q 'Status: active'; then
+            info "ufw already active — existing rules are kept, only defaults + the rules below are added"
+        fi
+        if [[ $HAS_TAILSCALE -eq 1 ]]; then
+            run "ufw: trust tailscale0" ufw allow in on tailscale0
+            run "ufw: tailscale direct connections (41641/udp)" ufw allow 41641/udp
+        fi
+        if [[ $pihole_lan -eq 1 ]]; then
+            local n
+            for n in $lan_nets; do
+                run "ufw: Pi-hole DNS from $n" ufw allow from "$n" to any port 53 proto tcp
+                run "ufw: Pi-hole DNS from $n" ufw allow from "$n" to any port 53 proto udp
+                run "ufw: Pi-hole web from $n" ufw allow from "$n" to any port 80 proto tcp
+                run "ufw: Pi-hole web (TLS) from $n" ufw allow from "$n" to any port 443 proto tcp
+                [[ $pihole_dhcp -eq 1 ]] && run "ufw: Pi-hole DHCP from $n" ufw allow from "$n" to any port 67 proto udp
+            done
+            [[ -z "$lan_nets" ]] && warn "Pi-hole detected but no LAN subnet found — allow port 53 manually: ufw allow 53"
+        fi
         local was_active=0
         ufw status 2>/dev/null | grep -q 'Status: active' && was_active=1
         run "ufw default deny incoming" ufw default deny incoming
@@ -825,6 +1057,8 @@ sec_firewall() {
         if [[ $need_ssh -eq 1 ]]; then
             run "ufw allow ssh port $ssh_port (rate-limited)" ufw limit "$ssh_port/tcp"
         fi
+        fw_warn_listeners "$ssh_port"
+        fw_warn_stale_rules
         if [[ $DRY_RUN -eq 0 ]]; then
             [[ $was_active -eq 0 ]] && rb "ufw disable"
             ufw --force enable >> "$LOG_FILE" 2>&1 && log "ufw enabled"
@@ -838,6 +1072,17 @@ sec_firewall() {
             run "allow ssh" firewall-cmd --permanent --add-service=ssh
             [[ "$ssh_port" != "22" ]] && run "allow ssh port $ssh_port" firewall-cmd --permanent --add-port="$ssh_port/tcp"
         fi
+        if [[ $HAS_TAILSCALE -eq 1 ]]; then
+            run "firewalld: trust tailscale0" firewall-cmd --permanent --zone=trusted --add-interface=tailscale0
+            run "firewalld: tailscale 41641/udp" firewall-cmd --permanent --add-port=41641/udp
+        fi
+        if [[ $pihole_lan -eq 1 ]]; then
+            run "firewalld: Pi-hole DNS" firewall-cmd --permanent --add-service=dns
+            run "firewalld: Pi-hole web" firewall-cmd --permanent --add-service=http
+            run "firewalld: Pi-hole web (TLS)" firewall-cmd --permanent --add-service=https
+            [[ $pihole_dhcp -eq 1 ]] && run "firewalld: Pi-hole DHCP" firewall-cmd --permanent --add-service=dhcp
+        fi
+        fw_warn_listeners "$ssh_port"
         run "reload firewalld" firewall-cmd --reload
     elif command -v nft >/dev/null 2>&1; then
         warn "Only nftables found — writing an example ruleset to /etc/nftables.conf.starhard-example (NOT activated)"
@@ -1011,10 +1256,49 @@ sec_ips() {
 #===============================================================================
 # 9. auditd
 #===============================================================================
+audit_dedupe() {
+    # audit_dedupe <our-file>  — stdin: our rules; stdout: our rules minus any watch path or
+    # syscall rule already present in ANOTHER file under /etc/audit/rules.d/. auditctl aborts the
+    # whole load on the first duplicate ("Rule exists"), which then fails audit-rules.service and auditd.
+    local ours="$1" other
+    local -a others=()
+    for other in /etc/audit/rules.d/*.rules; do
+        [[ -f "$other" && "$other" != "$ours" ]] && others+=("$other")
+    done
+    if [[ ${#others[@]} -eq 0 ]]; then cat; return 0; fi
+    awk -v ourfile="$ours" '
+        function norm(l) { gsub(/[ \t]+/, " ", l); sub(/^ /, "", l); sub(/ $/, "", l); return l }
+        FILENAME != "-" {
+            line = norm($0)
+            if (line ~ /^-w /) { split(line, f, " "); paths[f[2]] = FILENAME }
+            else if (line ~ /^-a /) { sub(/ -k [^ ]+$/, "", line); rules[line] = FILENAME }
+            next
+        }
+        {
+            line = norm($0)
+            if (line ~ /^-w /) {
+                split(line, f, " ")
+                if (f[2] in paths) { print "# skipped (already watched in " paths[f[2]] "): " $0; next }
+            } else if (line ~ /^-a /) {
+                key = line; sub(/ -k [^ ]+$/, "", key)
+                if (key in rules) { print "# skipped (already in " rules[key] "): " $0; next }
+            }
+            print
+        }' "${others[@]}" -
+}
+
 sec_auditd() {
     command -v auditctl >/dev/null 2>&1 || { info "auditd not installed — skipping"; return 0; }
     local arches="b64"
     [[ "$ARCH" == "x86_64" ]] && arches="b64 b32"
+    # aarch64/riscv64 have no legacy unlink/rename/chmod/chown/lchown syscalls — only the *at variants.
+    # auditctl aborts the whole rule load on an unknown syscall name.
+    local sc_delete="unlinkat,renameat,renameat2" sc_perm="fchmod,fchmodat,fchown,fchownat" sc_open="openat,openat2"
+    if [[ "$ARCH" == "x86_64" ]]; then
+        sc_delete="unlink,unlinkat,rename,renameat,renameat2"
+        sc_perm="chmod,fchmod,fchmodat,chown,fchown,fchownat,lchown"
+        sc_open="open,openat,openat2"
+    fi
     {
         cat <<'EOF'
 -D
@@ -1051,7 +1335,20 @@ sec_auditd() {
 -w /etc/apparmor/ -p wa -k mac
 -w /etc/apparmor.d/ -p wa -k mac
 -w /etc/selinux/ -p wa -k mac
+
+# Library preloading (classic userland keylogger / rootkit hook point)
+-w /etc/ld.so.preload -p wa -k preload
+-w /etc/ld.so.conf.d/ -p wa -k preload
 EOF
+        if [[ $IS_PI -eq 1 && -n "$PI_BOOT" ]]; then
+            cat <<EOF
+
+# Raspberry Pi boot configuration (FAT partition — permissions can't be tightened, so watch it)
+-w $PI_BOOT/config.txt -p wa -k pi_boot
+-w $PI_BOOT/cmdline.txt -p wa -k pi_boot
+-w /etc/default/rpi-eeprom-update -p wa -k pi_boot
+EOF
+        fi
         local a
         for a in $arches; do
             cat <<EOF
@@ -1061,8 +1358,11 @@ EOF
 -a always,exit -F arch=$a -S init_module,finit_module,delete_module -k modules
 -a always,exit -F arch=$a -S adjtimex,settimeofday,clock_settime -k time-change
 -a always,exit -F arch=$a -S mount -F auid>=1000 -F auid!=unset -k mounts
--a always,exit -F arch=$a -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=unset -k delete
--a always,exit -F arch=$a -S chmod,fchmod,fchmodat,chown,fchown,fchownat,lchown -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=$a -S $sc_delete -F auid>=1000 -F auid!=unset -k delete
+-a always,exit -F arch=$a -S $sc_perm -F auid>=1000 -F auid!=unset -k perm_mod
+# Opens of keyboard/mouse devices by a logged-in user (incl. via sudo) — userland keylogger indicator.
+# Boot-time daemons (logind, display manager) have auid unset and are excluded.
+-a always,exit -F arch=$a -S $sc_open -F dir=/dev/input -F auid>=1000 -F auid!=unset -k input_dev
 EOF
         done
         cat <<'EOF'
@@ -1073,20 +1373,31 @@ EOF
 # Make configuration immutable (requires reboot to change rules)
 -e 2
 EOF
-    } | write_file /etc/audit/rules.d/50-hardening.rules 640
+    } | audit_dedupe /etc/audit/rules.d/50-hardening.rules | write_file /etc/audit/rules.d/50-hardening.rules 640
 
     if [[ $DRY_RUN -eq 0 ]]; then
+        local skipped
+        skipped="$(grep -c '^# skipped' /etc/audit/rules.d/50-hardening.rules 2>/dev/null || echo 0)"
+        [[ "$skipped" -gt 0 ]] && info "$skipped rule(s) already defined by other files in /etc/audit/rules.d/ — left to those files"
         if auditctl -s 2>/dev/null | grep -q '^enabled 2'; then
             warn "audit is in immutable mode (-e 2) — new rules load on next reboot"
         else
             if augenrules --load >> "$LOG_FILE" 2>&1; then
                 log "audit rules loaded"
             else
-                warn "augenrules --load reported errors (see log)"
+                warn "augenrules --load reported errors: $(grep -iE 'syscall|error|invalid' "$LOG_FILE" | tail -1)"
             fi
         fi
     fi
     svc_enable auditd
+
+    # sysstat (sar) — Lynis ACCT-9626
+    if ! command -v sar >/dev/null 2>&1; then pkg_install sysstat; fi
+    if [[ -f /etc/default/sysstat ]]; then
+        backup_file /etc/default/sysstat
+        [[ $DRY_RUN -eq 0 ]] && sed -i 's/^ENABLED=.*/ENABLED="true"/' /etc/default/sysstat
+    fi
+    has_systemd && unit_exists sysstat.service && svc_enable sysstat
 
     # Process accounting
     if command -v accton >/dev/null 2>&1; then
@@ -1178,12 +1489,23 @@ LOG="/var/log/starhard/scan-$(date +%F).log"
 
     if command -v clamscan >/dev/null 2>&1; then
         echo; echo "-- clamscan --"
+        # clamscan loads ~1 GB of signatures; skip on low-memory boxes (2 GB Pi etc.)
+        AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+        if [ "${AVAIL_KB:-0}" -lt 1500000 ]; then
+            echo "SKIPPED: only $((AVAIL_KB/1024)) MB RAM available (need ~1500 MB). Run clamscan manually when idle."
+            logger -t starhard-scan "clamscan skipped: low memory"
+        else
         DIRS=""
         for d in /etc /home /root /tmp /var/tmp /usr/local /opt /srv /var/www; do
             [ -d "$d" ] && DIRS="$DIRS $d"
         done
+        # Removable media currently mounted (USB sticks, SD cards)
+        for m in $(findmnt -rn -o TARGET 2>/dev/null | grep -E '^/(media|mnt|run/media)(/|$)'); do
+            DIRS="$DIRS $m"; echo "including removable media: $m"
+        done
         # shellcheck disable=SC2086
         clamscan -r -i --exclude-dir='^/(proc|sys|dev|run)' $DIRS
+        fi
     fi
 
     if command -v unhide >/dev/null 2>&1; then
@@ -1210,7 +1532,241 @@ LOG="/var/log/starhard/scan-$(date +%F).log"
 logger -t starhard-scan "weekly scan complete — see $LOG"
 exit 0
 EOF
-    write_timer starhard-scan "StarHard weekly malware/rootkit/integrity scan" weekly /usr/local/sbin/starhard-scan
+    local scan_exec=/usr/local/sbin/starhard-scan
+    if command -v systemd-inhibit >/dev/null 2>&1; then
+        # Laptops suspend mid-scan otherwise; this holds idle-suspend while it runs (lid close still wins)
+        scan_exec="/usr/bin/systemd-inhibit --what=sleep:idle --who=StarHard --why=weekly-security-scan /usr/local/sbin/starhard-scan"
+    fi
+    write_timer starhard-scan "StarHard weekly malware/rootkit/integrity scan" weekly "$scan_exec"
+    if [[ $DRY_RUN -eq 0 && ! -e /etc/starhard/ignore-units ]]; then
+        mkdir -p /etc/starhard
+        record_rm /etc/starhard/ignore-units
+        printf '# starhard-status: failed units to ignore, one per line (e.g. suricata, hostapd-wpe)\n' > /etc/starhard/ignore-units
+    fi
+
+
+    # One-screen security digest
+    write_file /usr/local/sbin/starhard-status 755 <<'EOF'
+#!/usr/bin/env bash
+# starhard-status — one-screen digest of what the StarHard tooling has found.
+# Usage: sudo starhard-status [--days N]   (default 7)
+DAYS=7
+[[ "${1:-}" == "--days" && -n "${2:-}" ]] && DAYS="$2"
+[[ $EUID -ne 0 ]] && { echo "Run as root: sudo starhard-status"; exit 1; }
+
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'; N='\033[0m'
+ok()   { echo -e "  ${G}OK  ${N} $1"; }
+bad()  { echo -e "  ${R}!!  ${N} $1"; }
+note() { echo -e "  ${Y}--  ${N} $1"; }
+hdr()  { echo; echo -e "${B}== $1 ==${N}"; }
+ISSUES=0
+
+hdr "System"
+echo "  $(hostname) — $(uname -r) — up $(uptime -p 2>/dev/null | sed 's/^up //')"
+if [[ -f /var/run/reboot-required ]]; then bad "Reboot required (kernel/libc updated)"; ISSUES=$((ISSUES+1)); else ok "No reboot pending"; fi
+ignore_re='^$'
+if [[ -s /etc/starhard/ignore-units ]]; then
+    ignore_re="^($(grep -Ev '^\s*(#|$)' /etc/starhard/ignore-units | sed 's/\.service$//' | paste -sd'|'))(\.service)?$"
+fi
+failed="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -Ev "$ignore_re" | tr '\n' ' ')"
+if [[ -n "$failed" ]]; then bad "Failed services: $failed"; ISSUES=$((ISSUES+1)); else ok "No failed services"; fi
+
+hdr "Updates"
+if command -v apt-get >/dev/null 2>&1; then
+    sec="$(apt-get -s upgrade 2>/dev/null | grep -ci '^inst.*securi' || true)"
+    all="$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst' || true)"
+    if [[ "${sec:-0}" -gt 0 ]]; then bad "$sec security update(s) pending ($all total) — run: apt full-upgrade"; ISSUES=$((ISSUES+1))
+    elif [[ "${all:-0}" -gt 0 ]]; then note "$all package update(s) pending (none security)"
+    else ok "System up to date"; fi
+    last="$(grep -h 'Packages that were upgraded' /var/log/unattended-upgrades/unattended-upgrades.log 2>/dev/null | tail -1 | cut -c1-19)"
+    [[ -n "$last" ]] && note "Last unattended-upgrade: $last"
+elif command -v dnf >/dev/null 2>&1; then
+    n="$(dnf -q updateinfo list --security 2>/dev/null | grep -c . || true)"
+    if [[ "${n:-0}" -gt 0 ]]; then bad "$n security update(s) pending"; ISSUES=$((ISSUES+1)); else ok "No security updates pending"; fi
+fi
+command -v pihole >/dev/null 2>&1 && note "Pi-hole: $(pihole -v 2>/dev/null | head -1 | sed 's/^ *//')  (update with: pihole -up)"
+
+hdr "Malware scan (ClamAV / unhide / integrity) — last $DAYS days"
+scanlog="$(ls -t /var/log/starhard/scan-*.log 2>/dev/null | head -1)"
+if [[ -z "$scanlog" ]]; then
+    note "No scan has run yet — run: starhard-scan   (timer: $(systemctl list-timers starhard-scan.timer --no-legend 2>/dev/null | awk '{print $1" "$2" "$3}'))"
+else
+    age=$(( ( $(date +%s) - $(stat -c %Y "$scanlog") ) / 86400 ))
+    note "Last scan: $(basename "$scanlog" .log | sed 's/scan-//') (${age}d ago)"
+    inf="$(grep -m1 '^Infected files:' "$scanlog" | awk '{print $3}')"
+    if [[ -z "$inf" ]]; then
+        if pgrep -x clamscan >/dev/null 2>&1; then
+            secs="$(ps -o etimes= -C clamscan 2>/dev/null | head -1 | xargs)"
+            note "ClamAV: scan in progress ($(( ${secs:-0} / 60 )) min elapsed)"
+        elif grep -q 'SKIPPED: only' "$scanlog"; then note "ClamAV skipped last run (low memory)"
+        else note "ClamAV: no result in log (scan interrupted?)"; fi
+    elif [[ "$inf" == "0" ]]; then ok "ClamAV: 0 infected files"
+    else bad "ClamAV: $inf infected file(s):"; grep ' FOUND$' "$scanlog" | sed 's/^/        /'; ISSUES=$((ISSUES+1)); fi
+    if grep -q 'Found HIDDEN' "$scanlog"; then bad "unhide: HIDDEN process/port reported — see $scanlog"; ISSUES=$((ISSUES+1))
+    elif grep -q 'unhide' "$scanlog"; then ok "unhide: no hidden processes"; fi
+    chg="$(sed -n '/-- package integrity --/,/-- lynis --/p' "$scanlog" | grep -Ev '^--|^$|^Full report' | grep -c . || true)"
+    if [[ "${chg:-0}" -gt 0 ]]; then note "Package integrity: $chg modified file(s) — see $scanlog (config edits are normal)"
+    else ok "Package integrity: no modified package files"; fi
+fi
+db="$(ls -t /var/lib/clamav/daily.c[lv]d 2>/dev/null | head -1)"
+if [[ -n "$db" ]]; then
+    dage=$(( ( $(date +%s) - $(stat -c %Y "$db") ) / 86400 ))
+    if [[ $dage -gt 3 ]]; then bad "ClamAV signatures are ${dage}d old — check: systemctl status clamav-freshclam"; ISSUES=$((ISSUES+1)); else ok "ClamAV signatures current (${dage}d)"; fi
+fi
+
+hdr "File integrity (AIDE)"
+aidelog="$(ls -t /var/log/starhard/aide-*.log /var/log/aide/aide.log 2>/dev/null | head -1)"
+aidedb="$(ls -t /var/lib/aide/aide.db /var/lib/aide/aide.db.gz 2>/dev/null | head -1)"
+if [[ -z "$aidelog" ]]; then
+    note "No AIDE check log yet (runs daily)"
+elif [[ -n "$aidedb" && "$aidedb" -nt "$aidelog" ]]; then
+    ok "Baseline rebuilt $(( ( $(date +%s) - $(stat -c %Y "$aidedb") ) / 3600 ))h ago — newer than the last check; next daily check will report against it"
+else
+    aage=$(( ( $(date +%s) - $(stat -c %Y "$aidelog") ) / 86400 ))
+    if grep -q 'found NO differences\|AIDE found no differences' "$aidelog" 2>/dev/null; then
+        ok "Last check (${aage}d ago): no changes"
+    else
+        a="$(grep -m1 -E '^ *Added entries:' "$aidelog" | awk '{print $NF}')"
+        r="$(grep -m1 -E '^ *Removed entries:' "$aidelog" | awk '{print $NF}')"
+        c="$(grep -m1 -E '^ *Changed entries:' "$aidelog" | awk '{print $NF}')"
+        if [[ -n "$a$r$c" ]]; then
+            if [[ "${a:-0}" -gt 5000 || "${r:-0}" -gt 5000 ]]; then
+                bad "AIDE baseline is stale (added ${a:-0}, removed ${r:-0}) — reports are noise until you rebuild: aideinit --yes --force"; ISSUES=$((ISSUES+1))
+            else
+                note "Last check (${aage}d ago): added ${a:-0}, removed ${r:-0}, changed ${c:-0} — $aidelog"
+            fi
+            crit="$(grep -E '^(changed|f[^ ]*):? */(etc/(passwd|shadow|sudoers|ssh)|usr/(s?bin)/|usr/local/s?bin/)' "$aidelog" | head -5)"
+            if [[ -n "$crit" ]]; then bad "Changes in sensitive paths:"; echo "$crit" | sed 's/^/        /'; ISSUES=$((ISSUES+1)); fi
+            note "After a legitimate upgrade, refresh the baseline: aideinit --yes --force"
+        else
+            note "Last check (${aage}d ago): see $aidelog"
+        fi
+    fi
+fi
+
+hdr "Audit trail (auditd) — last $DAYS days"
+if command -v ausearch >/dev/null 2>&1 && systemctl is-active -q auditd 2>/dev/null; then
+    since="$(date -d "$DAYS days ago" '+%m/%d/%Y' 2>/dev/null || echo recent)"
+    cnt() { ausearch -k "$1" -ts "$since" 2>/dev/null | grep -c '^type=SYSCALL\|^type=PATH' ; }
+    for k in identity scope modules pi_boot sshd sudo_log preload input_dev; do
+        n="$(cnt "$k")"
+        [[ "${n:-0}" -gt 0 ]] && note "$k: $n event(s)   → ausearch -k $k -ts $since -i | less"
+    done
+    fl="$(ausearch -m USER_LOGIN -ts "$since" 2>/dev/null | grep -c 'res=failed' || true)"
+    if [[ "${fl:-0}" -gt 20 ]]; then bad "$fl failed logins"; ISSUES=$((ISSUES+1)); elif [[ "${fl:-0}" -gt 0 ]]; then note "$fl failed login(s)"; else ok "No failed logins"; fi
+    ok "auditd running"
+else
+    bad "auditd not running"; ISSUES=$((ISSUES+1))
+fi
+
+hdr "Keylogger indicators"
+# 1. Library preload hooks
+if [[ -s /etc/ld.so.preload ]]; then
+    bad "/etc/ld.so.preload exists and is not empty — every process loads these libraries:"; sed 's/^/        /' /etc/ld.so.preload; ISSUES=$((ISSUES+1))
+else
+    ok "No /etc/ld.so.preload"
+fi
+pre="$(grep -ls 'LD_PRELOAD' /etc/environment /etc/profile /etc/profile.d/* /etc/bash.bashrc /etc/zsh/zshenv 2>/dev/null | tr '\n' ' ')"
+[[ -n "$pre" ]] && { bad "LD_PRELOAD set system-wide in: $pre"; ISSUES=$((ISSUES+1)); }
+# 2. Who holds the input devices right now
+known='^(Xorg|Xwayland|weston|wayfire|labwc|sway|hyprland|kwin_wayland|gnome-shell|mutter|cage|cosmic-comp|river|niri|systemd-logind|upowerd|acpid|thd|triggerhappy|kodi|kodi\.bin|steam|steamwebhelper|gamescope|retroarch|lightdm|sddm|gdm|gdm-wayland-ses|pipewire|wireplumber)$'
+holders="$(for fd in /proc/[0-9]*/fd/*; do
+    t="$(readlink "$fd" 2>/dev/null)" || continue
+    [[ "$t" == /dev/input/* ]] || continue
+    pid="${fd#/proc/}"; pid="${pid%%/*}"
+    echo "$pid"
+done | sort -un)"
+if [[ -z "$holders" ]]; then
+    ok "No process currently holds an input device"
+else
+    while read -r pid; do
+        comm="$(tr -d '\0' < "/proc/$pid/comm" 2>/dev/null)"
+        exe="$(readlink "/proc/$pid/exe" 2>/dev/null || echo '?')"
+        usr="$(stat -c %U "/proc/$pid" 2>/dev/null)"
+        if [[ "$exe" == *"(deleted)"* ]]; then
+            bad "PID $pid ($comm, $usr) holds input devices from a DELETED binary: $exe"; ISSUES=$((ISSUES+1))
+        elif [[ "$exe" == /tmp/* || "$exe" == /var/tmp/* || "$exe" == /dev/shm/* || "$exe" == /home/* || "$exe" == /root/* ]]; then
+            bad "PID $pid ($comm, $usr) holds input devices, running from $exe"; ISSUES=$((ISSUES+1))
+        elif [[ "$comm" =~ $known ]]; then
+            ok "$comm (PID $pid, $usr) — expected to read input"
+        else
+            note "$comm (PID $pid, $usr) reads input devices — $exe   (unfamiliar? ps -fp $pid)"
+        fi
+    done <<< "$holders"
+fi
+# 3. Display server: on X11 any process on the display can sniff keys (XRecord), undetectably
+xs="$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}' | while read -r sid; do loginctl show-session "$sid" -p Type --value 2>/dev/null; done | grep -c '^x11$')"
+if [[ "${xs:-0}" -gt 0 ]]; then note "X11 session active: any process on the display can read keystrokes — Wayland closes this"
+else ok "No X11 session (Wayland/console only)"; fi
+
+hdr "USB devices"
+if command -v usbguard >/dev/null 2>&1 && systemctl is-active -q usbguard 2>/dev/null; then
+    mode="$(grep -m1 '^ImplicitPolicyTarget=' /etc/usbguard/usbguard-daemon.conf 2>/dev/null | cut -d= -f2)"
+    ok "USBGuard running (unknown devices: ${mode:-?})"
+    # Current devices; flag HID (03) / network (02, e0) class devices that have no allow rule
+    usbguard list-devices 2>/dev/null | while IFS= read -r line; do
+        id="${line%%:*}"; state="$(echo "$line" | awk '{print $2}')"
+        name="$(echo "$line" | grep -o 'name "[^"]*"' | cut -d'"' -f2)"
+        vid="$(echo "$line" | grep -o 'id [0-9a-f:]*' | cut -d' ' -f2)"
+        ifs="$(echo "$line" | grep -o 'with-interface {[^}]*}\|with-interface [0-9a-f:]*' | head -1)"
+        serial="$(echo "$line" | grep -o 'serial "[^"]*"' | cut -d'"' -f2)"
+        cls=""
+        echo "$ifs" | grep -q '03:' && cls="HID"
+        echo "$ifs" | grep -Eq '(02|e0):' && cls="${cls:+$cls+}NET"
+        if [[ "$state" == "block" || "$state" == "reject" ]]; then
+            bad "BLOCKED  [$id] $vid ${name:-?} ${cls:+($cls)} — allow with: starhard-usb-allow $id"; ISSUES=$((ISSUES+1))
+        elif [[ -n "$cls" ]] && ! grep -q "serial \"$serial\"" /etc/usbguard/rules.conf 2>/dev/null && ! grep -q "id $vid" /etc/usbguard/rules.conf 2>/dev/null; then
+            note "allowed  [$id] $vid ${name:-?} ($cls) — not in the policy file (plugged in since setup)"
+        else
+            echo "          [$id] $vid ${name:-?}${cls:+ ($cls)}"
+        fi
+    done
+    # Attach / block events this week
+    if command -v ausearch >/dev/null 2>&1; then
+        since="$(date -d "$DAYS days ago" '+%m/%d/%Y' 2>/dev/null)"
+        ev="$(ausearch -m USER_DEVICE -ts "$since" 2>/dev/null | grep -c 'op=insert' || true)"
+        bl="$(ausearch -m USER_DEVICE -ts "$since" 2>/dev/null | grep -c 'target=block\|target=reject' || true)"
+        if [[ "${bl:-0}" -gt 0 ]]; then note "$ev USB attach event(s), $bl blocked   → ausearch -m USER_DEVICE -ts $since -i | grep -i block"
+        elif [[ "${ev:-0}" -gt 0 ]]; then note "$ev USB attach event(s), none blocked   → ausearch -m USER_DEVICE -ts $since -i"
+        else ok "No USB attach events in $DAYS days"; fi
+    fi
+    if systemctl is-enabled -q starhard-usb-lock.service 2>/dev/null && ! systemctl is-active -q starhard-usb-lock.service 2>/dev/null; then
+        bad "lock-screen USB watcher not running"; ISSUES=$((ISSUES+1))
+    fi
+elif command -v usbguard >/dev/null 2>&1; then
+    bad "USBGuard installed but not running"; ISSUES=$((ISSUES+1))
+else
+    note "USBGuard not installed — run StarHard section 20"
+fi
+
+hdr "Intrusion prevention"
+if command -v cscli >/dev/null 2>&1 && systemctl is-active -q crowdsec 2>/dev/null; then
+    n="$(cscli decisions list -o raw 2>/dev/null | tail -n +2 | grep -c . || true)"
+    ok "CrowdSec running — $n active ban(s)   → cscli alerts list"
+    if ! cscli bouncers list -o raw 2>/dev/null | grep -qi firewall; then bad "CrowdSec has NO firewall bouncer registered — it detects but does not block"; ISSUES=$((ISSUES+1)); fi
+    if systemctl is-active -q fail2ban 2>/dev/null; then bad "fail2ban is ALSO running — two ban engines conflict; run: StarHard.sh --sections 8 --ids crowdsec"; ISSUES=$((ISSUES+1)); fi
+elif command -v fail2ban-client >/dev/null 2>&1 && systemctl is-active -q fail2ban 2>/dev/null; then
+    b="$(fail2ban-client status sshd 2>/dev/null | grep 'Currently banned' | awk '{print $NF}')"
+    t="$(fail2ban-client status sshd 2>/dev/null | grep 'Total banned' | awk '{print $NF}')"
+    ok "fail2ban running — sshd: ${b:-0} banned now, ${t:-0} total"
+else
+    bad "No intrusion prevention service running"; ISSUES=$((ISSUES+1))
+fi
+if command -v ufw >/dev/null 2>&1; then
+    ufw status 2>/dev/null | grep -q 'Status: active' && ok "ufw active" || { bad "ufw INACTIVE"; ISSUES=$((ISSUES+1)); }
+elif command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --state 2>/dev/null | grep -q running && ok "firewalld running" || { bad "firewalld not running"; ISSUES=$((ISSUES+1)); }
+fi
+
+hdr "Lynis"
+if [[ -f /var/lib/starhard/lynis-index ]]; then
+    read -r ts idx < <(tail -n1 /var/lib/starhard/lynis-index)
+    note "Hardening index $idx/100 (run $ts)   → starhard.sh --audit for a fresh one"
+fi
+
+echo
+if [[ $ISSUES -eq 0 ]]; then echo -e "${G}Nothing needs attention.${N}"; else echo -e "${R}$ISSUES item(s) need attention.${N}"; fi
+EOF
 
     # Retire rkhunter/chkrootkit if a previous version installed them
     if pkg_installed rkhunter || pkg_installed chkrootkit; then
@@ -1244,8 +1800,36 @@ Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::SyslogEnable "true";
 EOF
+            if [[ $IS_PI -eq 1 ]] || ls /etc/apt/sources.list.d/raspi.list >/dev/null 2>&1; then
+                # Kernel, firmware, EEPROM and Pi-specific packages come from archive.raspberrypi.com,
+                # which is NOT a -security pocket — without this the Pi never gets kernel updates.
+                write_file /etc/apt/apt.conf.d/53starhard-raspberrypi 644 <<'EOF'
+// StarHard: include Raspberry Pi Foundation repos in unattended upgrades
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Raspberry Pi Foundation,codename=${distro_codename}";
+    "origin=Raspbian,codename=${distro_codename},label=Raspbian";
+    "origin=Debian,codename=${distro_codename},label=Debian-Security";
+};
+EOF
+                [[ $DRY_RUN -eq 0 ]] && log "unattended-upgrades: Raspberry Pi Foundation origin added"
+            fi
+            if [[ $HAS_TAILSCALE -eq 1 ]]; then
+                write_file /etc/apt/apt.conf.d/54starhard-tailscale 644 <<'EOF'
+// StarHard: keep the Tailscale client current (it's on your network edge)
+Unattended-Upgrade::Origins-Pattern { "origin=Tailscale"; };
+EOF
+            fi
+            [[ $HAS_PIHOLE -eq 1 ]] && info "Pi-hole updates itself with 'pihole -up' (not apt) — run it regularly or cron it"
             has_systemd && unit_exists unattended-upgrades.service && svc_enable unattended-upgrades
-            case "$OS_ID" in kali|parrot) warn "Rolling distro: '${OS_ID}' has no -security pocket; unattended-upgrades will do nothing. Update manually." ;; esac
+            case "$OS_ID" in
+                kali|parrot)
+                    warn "Rolling distro: '${OS_ID}' has no -security pocket; unattended-upgrades will do nothing. Update manually."
+                    if [[ $DRY_RUN -eq 0 && -f /etc/starhard/ignore-units ]] && ! grep -q '^suricata' /etc/starhard/ignore-units; then
+                        printf '# Pentest daemons that ship unconfigured on %s and fail at every boot\nhostapd-wpe\nisc-dhcp-server\nlighttpd-maint\nsslh\nsuricata\n' "$OS_ID" >> /etc/starhard/ignore-units
+                        info "starhard-status: ignoring unconfigured pentest daemons (edit /etc/starhard/ignore-units)"
+                    fi
+                    ;;
+            esac
             ;;
         dnf)
             if [[ -f /etc/dnf/automatic.conf ]]; then
@@ -1284,8 +1868,10 @@ EOF
     tighten /etc/gshadow o-rwx
     tighten /etc/crontab 0600
     tighten /etc/ssh/sshd_config 0600
-    tighten /boot/grub/grub.cfg 0600
-    tighten /boot/grub2/grub.cfg 0600
+    if [[ $IS_PI -eq 0 ]]; then
+        tighten /boot/grub/grub.cfg 0600
+        tighten /boot/grub2/grub.cfg 0600
+    fi
     local d
     for d in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do
         [[ -d "$d" ]] && tighten "$d" 700
@@ -1412,21 +1998,6 @@ EOF
             svc_mask "$s"
         done
 
-        # USBGuard: allow currently attached devices, block new ones
-        if command -v usbguard >/dev/null 2>&1; then
-            if [[ ! -s /etc/usbguard/rules.conf ]]; then
-                if [[ $DRY_RUN -eq 0 ]]; then
-                    mkdir -p /etc/usbguard
-                    record_rm /etc/usbguard/rules.conf
-                    usbguard generate-policy > /etc/usbguard/rules.conf 2>>"$LOG_FILE" && chmod 600 /etc/usbguard/rules.conf
-                    log "USBGuard policy generated from currently attached devices"
-                else
-                    info "DRY-RUN: would generate USBGuard policy"
-                fi
-            fi
-            svc_enable usbguard
-            warn "USBGuard active: new USB devices are blocked until allowed with 'usbguard allow-device <id>'"
-        fi
     fi
     return 0
 }
@@ -1491,6 +2062,10 @@ grub_regen() {
 }
 
 sec_grub() {
+    if [[ $IS_PI -eq 1 ]]; then
+        info "Raspberry Pi has no GRUB — bootloader handled in section 19"
+        return 0
+    fi
     if [[ $ASSUME_YES -eq 1 || $DRY_RUN -eq 1 ]]; then
         info "GRUB password is interactive-only — skipped"
         return 0
@@ -1515,8 +2090,16 @@ sec_grub() {
     done
     [[ -n "$mkpw" ]] || { info "GRUB not found — skipped"; return 0; }
     if ask "Set a GRUB password (protects boot parameters; normal boot stays password-free)?"; then
-        local hash
-        hash="$("$mkpw" | grep -o 'grub\.pbkdf2\.sha512\..*' || true)"
+        local hash pw1 pw2
+        while :; do
+            read -r -s -p "  GRUB password: " pw1; echo
+            read -r -s -p "  Confirm:       " pw2; echo
+            [[ -z "$pw1" ]] && { err "Empty password — aborting GRUB step"; return 0; }
+            [[ "$pw1" == "$pw2" ]] && break
+            warn "Passwords do not match — try again"
+        done
+        hash="$(printf '%s\n%s\n' "$pw1" "$pw1" | "$mkpw" 2>/dev/null | grep -o 'grub\.pbkdf2\.sha512\..*' || true)"
+        unset pw1 pw2
         if [[ -n "$hash" ]]; then
             if [[ -e /etc/grub.d/40_custom ]]; then backup_file /etc/grub.d/40_custom; else record_rm /etc/grub.d/40_custom; fi
             cat > /etc/grub.d/40_custom <<EOF
@@ -1548,19 +2131,19 @@ STATE_DIR="/var/lib/starhard"
 lynis_section_for() {
     case "$1" in
         KRNL-5820|KRNL-6000|KRNL-5830) echo 2 ;;
-        USB-1000|STRG-1840|STRG-1846|NETW-3200|FILE-6430) echo 3 ;;
-        AUTH-9228|AUTH-9229|AUTH-9230|AUTH-9262|AUTH-9282|AUTH-9286|AUTH-9328|AUTH-9408|SCHD-7704) echo 4 ;;
+        STRG-1840|STRG-1846|NETW-3200|FILE-6430) echo 3 ;;
+        AUTH-9228|AUTH-9229|AUTH-9230|AUTH-9262|AUTH-9286|AUTH-9328|AUTH-9408|SCHD-7704) echo 4 ;;
         SSH-*) echo 6 ;;
-        FIRE-*) echo 7 ;;
-        ACCT-*|LOGG-2190) echo 9 ;;
+        FIRE-4508|FIRE-4512|FIRE-4534) echo 7 ;;
+        ACCT-*) echo 9 ;;
         FINT-*) echo 10 ;;
-        MALW-*|TOOL-5002) echo 11 ;;
+        MALW-*) echo 11 ;;
         PKGS-7390|PKGS-7398|PKGS-7420|DEB-0810|DEB-0880) echo 12 ;;
         BANN-*|FILE-7524) echo 13 ;;
         MACF-*) echo 14 ;;
-        FILE-6310|FILE-6336|FILE-6344|LOGG-2138|LOGG-2154) echo 15 ;;
+        FILE-6336|FILE-6344|LOGG-2138) echo 15 ;;
         PKGS-7346|PKGS-7382) echo 16 ;;
-        BOOT-*) echo 17 ;;
+        BOOT-5122) echo 17 ;;
         *) echo "" ;;
     esac
 }
@@ -1608,6 +2191,10 @@ lynis_summary() {
         while IFS= read -r line; do
             IFS='|' read -r id desc detail _ <<< "${line#suggestion[]=}"
             sec="$(lynis_section_for "$id")"
+            if [[ "$id" == "AUTH-9230" ]] && grep -Eq '^\s*ENCRYPT_METHOD\s+YESCRYPT' /etc/login.defs 2>/dev/null; then
+                printf '  %-10s %s  -> n/a (yescrypt in use; SHA rounds do not apply)\n' "$id" "$desc"
+                continue
+            fi
             printf '  %-10s %s' "$id" "$desc"
             [[ -n "$detail" && "$detail" != "-" ]] && printf ' [%s]' "$detail"
             if [[ -n "$sec" ]]; then
@@ -1657,6 +2244,243 @@ sec_lynis() {
 }
 
 #===============================================================================
+# 19. Raspberry Pi (runs only when a Pi is detected)
+#===============================================================================
+pi_default_iface() { ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'; }
+
+pi_add_overlay() {
+    # pi_add_overlay <overlay>  — appends dtoverlay=<overlay> under an [all] section, idempotent
+    local ov="$1" cfg="$PI_BOOT/config.txt"
+    if grep -Eq "^\s*dtoverlay=$ov\b" "$cfg"; then
+        info "dtoverlay=$ov already present"
+        return 0
+    fi
+    if [[ $DRY_RUN -eq 1 ]]; then info "DRY-RUN: would add dtoverlay=$ov to $cfg"; return 0; fi
+    backup_file "$cfg"
+    {
+        echo
+        echo "[all]"
+        echo "# StarHard"
+        echo "dtoverlay=$ov"
+    } >> "$cfg"
+    log "Added dtoverlay=$ov to $cfg (takes effect after reboot)"
+}
+
+sec_pi() {
+    if [[ $IS_PI -eq 0 ]]; then
+        info "Not a Raspberry Pi — skipped"
+        return 0
+    fi
+    log "Detected: $PI_MODEL"
+    if [[ -z "$PI_BOOT" ]]; then
+        warn "config.txt not found under /boot/firmware or /boot — skipping boot-config changes"
+    fi
+
+    # --- Bootloader reality check
+    warn "No bootloader password exists on a Raspberry Pi. Anyone with the SD card / NVMe has full access."
+    if ! lsblk -o TYPE 2>/dev/null | grep -q crypt; then
+        warn "Root filesystem is not encrypted. For data at rest use LUKS on a data partition (cryptsetup), or"
+        warn "an encrypted root via 'rpi-image-gen' / 'raspi-config > Advanced > Encrypt' where your OS release offers it."
+    else
+        log "Encrypted block device detected"
+    fi
+
+    # --- EEPROM bootloader firmware (Pi 4/5/CM4/CM5)
+    if command -v rpi-eeprom-update >/dev/null 2>&1; then
+        local ee
+        ee="$(rpi-eeprom-update 2>/dev/null || true)"
+        echo "$ee" | grep -E 'CURRENT|LATEST|RELEASE|BOOTLOADER' | sed 's/^/    /'
+        if echo "$ee" | grep -q 'UPDATE AVAILABLE'; then
+            if [[ $DRY_RUN -eq 1 ]]; then
+                info "DRY-RUN: would stage EEPROM bootloader update (rpi-eeprom-update -a)"
+            elif [[ $ASSUME_YES -eq 1 ]] || ask "EEPROM bootloader update available — stage it for next reboot?"; then
+                run "stage EEPROM update" rpi-eeprom-update -a
+            fi
+        else
+            log "EEPROM bootloader is up to date"
+        fi
+        has_systemd && unit_exists rpi-eeprom-update.service && svc_enable rpi-eeprom-update.service
+    else
+        info "rpi-eeprom-update not installed (only relevant for Pi 4/5 family) — apt install rpi-eeprom"
+    fi
+
+    # --- Radios via device-tree overlays (cuts power to the chip; cleaner than module blacklists)
+    if [[ -n "$PI_BOOT" ]]; then
+        if [[ $PI_DISABLE_BT -eq 1 ]]; then
+            pi_add_overlay disable-bt
+            has_systemd && unit_exists hciuart.service && svc_mask hciuart.service
+            has_systemd && unit_exists bluetooth.service && svc_mask bluetooth.service
+        fi
+        if [[ $PI_DISABLE_WIFI -eq 1 ]]; then
+            local dif
+            dif="$(pi_default_iface)"
+            if [[ "$dif" == wl* ]]; then
+                err "Default route is via $dif (Wi-Fi) — REFUSING to disable Wi-Fi, you would lose the box"
+            elif [[ $SSH_ACTIVE -eq 1 && "$(ip -o addr show 2>/dev/null | awk -v ip="$(echo "$SSH_CONNECTION" | awk '{print $3}')" '$4 ~ "^"ip"/" {print $2; exit}')" == wl* ]]; then
+                err "This SSH session arrived over Wi-Fi — REFUSING to disable Wi-Fi"
+            else
+                pi_add_overlay disable-wifi
+                [[ $DRY_RUN -eq 0 ]] && command -v rfkill >/dev/null 2>&1 && rfkill block wlan 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    # --- Memory note for the weekly scan
+    local mem_mb
+    mem_mb=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 ))
+    if [[ $mem_mb -lt 3000 ]]; then
+        warn "${mem_mb} MB RAM: the weekly ClamAV scan auto-skips when <1.5 GB is free. Run it manually at idle: sudo starhard-scan"
+    fi
+
+    # --- Serial console: a physical UART login bypasses everything above
+    if [[ -n "$PI_BOOT" && -f "$PI_BOOT/cmdline.txt" ]] && grep -q 'console=serial0' "$PI_BOOT/cmdline.txt"; then
+        if [[ "$PROFILE" == "server" ]]; then
+            if [[ $DRY_RUN -eq 0 ]]; then
+                backup_file "$PI_BOOT/cmdline.txt"
+                sed -i 's/console=serial0,[0-9]* //' "$PI_BOOT/cmdline.txt"
+                log "Serial console login removed from cmdline.txt (server profile)"
+            else
+                info "DRY-RUN: would remove console=serial0 from cmdline.txt"
+            fi
+        else
+            info "Serial console login is enabled in cmdline.txt (fine for a desktop; server profile removes it)"
+        fi
+    fi
+    return 0
+}
+
+#===============================================================================
+# 20. USB device control (USBGuard) — every profile
+#===============================================================================
+sec_usb() {
+    if ! command -v usbguard >/dev/null 2>&1; then
+        info "usbguard not installed (no package for $PKG?) — skipping"
+        return 0
+    fi
+    if ! has_systemd; then info "USBGuard setup requires systemd — skipping"; return 0; fi
+
+    local rules=/etc/usbguard/rules.conf conf=/etc/usbguard/usbguard-daemon.conf
+
+    # Base policy: everything attached right now is allowed. Never regenerate an existing policy.
+    if [[ ! -s "$rules" ]]; then
+        if [[ $DRY_RUN -eq 0 ]]; then
+            mkdir -p /etc/usbguard
+            record_rm "$rules"
+            usbguard generate-policy > "$rules" 2>>"$LOG_FILE" && chmod 600 "$rules"
+            log "USBGuard: $(grep -c '^allow' "$rules") currently attached device(s) allowed"
+        else
+            info "DRY-RUN: would snapshot attached devices into $rules"
+        fi
+    else
+        info "USBGuard policy already exists ($(grep -c '^allow' "$rules" 2>/dev/null || echo '?') allow rules) — keeping it"
+    fi
+
+    # StarHard rules appended once, after the device allow-list so known devices always win.
+    if [[ $DRY_RUN -eq 0 ]] && ! grep -q '# StarHard' "$rules" 2>/dev/null; then
+        backup_file "$rules"
+        if [[ "$PROFILE" == "server" ]]; then
+            cat >> "$rules" <<'EOF'
+
+# StarHard (server): anything not listed above is blocked. Authorise with: starhard-usb-allow <id>
+block
+EOF
+        else
+            cat >> "$rules" <<'EOF'
+
+# StarHard (desktop): known devices allowed above. Two hard blocks regardless of lock state:
+#  - a device that presents as a network adapter (PoisonTap / rogue USB-Ethernet)
+#  - a hub that also carries a HID interface (common in keystroke-injector cables)
+block with-interface one-of { 02:06:00 02:00:00 e0:01:03 ef:04:01 }
+block with-interface all-of { 09:00:00 03:00:00 }
+# Keyboards / HID that appear later are handled by the lock-screen rule set (see usbguard-lock)
+EOF
+        fi
+        log "USBGuard: StarHard rules appended ($PROFILE)"
+    fi
+
+    # Daemon config: desktop audits new devices (apply-policy but implicit target allow), server blocks.
+    if [[ -f "$conf" ]]; then
+        backup_file "$conf"
+        if [[ $DRY_RUN -eq 0 ]]; then
+            local implicit="allow"; [[ "$PROFILE" == "server" ]] && implicit="block"
+            sed -i -E "s/^ImplicitPolicyTarget=.*/ImplicitPolicyTarget=$implicit/" "$conf"
+            sed -i -E 's/^PresentDevicePolicy=.*/PresentDevicePolicy=apply-policy/' "$conf"
+            sed -i -E 's/^PresentControllerPolicy=.*/PresentControllerPolicy=keep/' "$conf"
+            sed -i -E 's/^InsertedDevicePolicy=.*/InsertedDevicePolicy=apply-policy/' "$conf"
+            sed -i -E 's/^AuditBackend=.*/AuditBackend=LinuxAudit/' "$conf"
+            grep -q '^AuditBackend=' "$conf" || echo 'AuditBackend=LinuxAudit' >> "$conf"
+            log "USBGuard daemon: implicit target '$implicit', audit via auditd"
+        fi
+    fi
+
+    # Desktop: block NEW HID (keyboards/mice/injectors) while the screen is locked.
+    # Implemented as a logind hook that swaps the implicit policy, so nothing is lost on unlock.
+    if [[ "$PROFILE" != "server" ]]; then
+        write_file /usr/local/sbin/starhard-usb-lockhook 755 <<'EOF'
+#!/bin/sh
+# Called by starhard-usb-lock.service on screen lock/unlock. lock = block new HID; unlock = allow again.
+case "$1" in
+    lock)   usbguard set-parameter ImplicitPolicyTarget block >/dev/null 2>&1 ;;
+    unlock) usbguard set-parameter ImplicitPolicyTarget allow >/dev/null 2>&1 ;;
+esac
+EOF
+        # A tiny watcher on the session Lock/Unlock signals (works for GNOME, KDE, labwc/swaylock via logind)
+        write_file /usr/local/sbin/starhard-usb-lockwatch 755 <<'EOF'
+#!/bin/sh
+# Follows logind LockedHint across all sessions; toggles USBGuard's implicit policy.
+state=""
+while :; do
+    locked=0
+    for sid in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+        [ "$(loginctl show-session "$sid" -p LockedHint --value 2>/dev/null)" = "yes" ] && locked=1
+    done
+    if [ "$locked" = "1" ] && [ "$state" != "locked" ]; then /usr/local/sbin/starhard-usb-lockhook lock; state=locked; fi
+    if [ "$locked" = "0" ] && [ "$state" != "unlocked" ]; then /usr/local/sbin/starhard-usb-lockhook unlock; state=unlocked; fi
+    sleep 3
+done
+EOF
+        write_file /etc/systemd/system/starhard-usb-lock.service 644 <<'EOF'
+[Unit]
+Description=StarHard: block new USB devices while the screen is locked
+After=usbguard.service
+Requires=usbguard.service
+
+[Service]
+ExecStart=/usr/local/sbin/starhard-usb-lockwatch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        [[ $DRY_RUN -eq 0 ]] && systemctl daemon-reload
+    fi
+
+    # One-command authorise helper
+    write_file /usr/local/sbin/starhard-usb-allow 755 <<'EOF'
+#!/usr/bin/env bash
+# starhard-usb-allow [id]   — permanently allow a USB device. No id: list blocked devices.
+[[ $EUID -ne 0 ]] && { echo "Run as root"; exit 1; }
+if [[ -z "${1:-}" ]]; then
+    echo "Blocked / rejected devices:"; usbguard list-devices -b 2>/dev/null || echo "  (none)"
+    echo; echo "All devices:"; usbguard list-devices 2>/dev/null
+    echo; echo "Usage: starhard-usb-allow <id>"; exit 0
+fi
+usbguard allow-device -p "$1" && echo "Device $1 allowed permanently (rule appended to /etc/usbguard/rules.conf)"
+EOF
+
+    svc_enable usbguard
+    [[ "$PROFILE" != "server" ]] && svc_enable starhard-usb-lock.service
+
+    if [[ "$PROFILE" == "server" ]]; then
+        warn "USBGuard BLOCKS every USB device not attached right now. Authorise new ones: starhard-usb-allow <id>"
+    else
+        info "USBGuard: logging all attaches; USB network adapters and HID-hubs blocked; new HID blocked while screen is locked"
+    fi
+    return 0
+}
+
+#===============================================================================
 # Audit mode dispatch (all functions are defined by this point)
 #===============================================================================
 if [[ $AUDIT -eq 1 ]]; then
@@ -1688,6 +2512,8 @@ section 14 "mandatory access control"          sec_mac
 section 15 "services, mounts, journald"        sec_services
 section 16 "cleanup"                           sec_cleanup
 section 17 "GRUB password"                     sec_grub
+[[ $IS_PI -eq 1 ]] && section 19 "Raspberry Pi" sec_pi
+section 20 "USB device control"                sec_usb
 section 18 "Lynis audit + report analysis"     sec_lynis
 
 #===============================================================================
@@ -1728,10 +2554,12 @@ echo "  11 Weekly starhard-scan: ClamAV, unhide, package integrity, Lynis"
 echo "  12 Automatic security updates"
 echo "  13 Banners, permissions (tighten-only), sudo use_pty/logfile"
 echo "  14 AppArmor enforce / SELinux status"
-echo "  15 ctrl-alt-del masked, persistent journald, /dev/shm noexec$( [[ "$PROFILE" == "server" ]] && echo ', /tmp noexec, avahi/cups/bt masked, usbguard')"
+echo "  15 ctrl-alt-del masked, persistent journald, /dev/shm noexec$( [[ "$PROFILE" == "server" ]] && echo ', /tmp noexec, avahi/cups/bt masked')"
 echo "  16 Cleanup: legacy packages, residuals, old kernels, docker (opt-in)"
 echo "  17 GRUB password (interactive)"
 echo "  18 Lynis audit run, warnings/suggestions mapped to sections, index tracked in $STATE_DIR/lynis-index"
+echo "  20 USBGuard: $( [[ "$PROFILE" == "server" ]] && echo 'block unknown devices' || echo 'audit mode + block USB-network/HID-hub + block new HID while locked' ) — authorise: starhard-usb-allow <id>"
+[[ $IS_PI -eq 1 ]] && echo "  19 Raspberry Pi: EEPROM, boot-config auditing, Pi update origin, radios$( [[ "$PROFILE" == "server" ]] && echo ', serial console')"
 echo
 echo "Backups + rollback script: $BACKUP_DIR"
 echo "Log: $LOG_FILE"
@@ -1739,7 +2567,8 @@ echo
 echo "Next steps:"
 echo "  1. Reboot"
 echo "  2. Verify:  sudo $0 --audit --profile $PROFILE --ids $IDS"
-echo "  3. Scan:    sudo /usr/local/sbin/starhard-scan   (also runs weekly)"
-echo "  4. Lynis:   see section 18 output above; 'lynis show details <TEST-ID>' for any item"
-echo "  5. Undo:    sudo bash $ROLLBACK  (then reboot)"
+echo "  3. Status:  sudo starhard-status   (one-screen digest: scans, AIDE, audit, bans, updates)"
+echo "  4. Scan:    sudo /usr/local/sbin/starhard-scan   (also runs weekly)"
+echo "  5. Lynis:   see section 18 output above; 'lynis show details <TEST-ID>' for any item"
+echo "  6. Undo:    sudo bash $ROLLBACK  (then reboot)"
 echo "==============================================================="
