@@ -324,7 +324,12 @@ done
 
 [[ "$PROFILE" =~ ^(desktop|server)$ ]] || { err "Profile must be desktop or server"; exit 1; }
 if [[ -z "$IDS" ]]; then
-    [[ "$PROFILE" == "server" ]] && IDS="crowdsec" || IDS="fail2ban"
+    # Prefer whatever is already installed so re-runs and --audit match the box; else profile default.
+    if command -v cscli >/dev/null 2>&1; then IDS="crowdsec"
+    elif command -v fail2ban-server >/dev/null 2>&1 && [[ "$PROFILE" != "server" ]]; then IDS="fail2ban"
+    elif [[ "$PROFILE" == "server" ]]; then IDS="crowdsec"
+    else IDS="fail2ban"
+    fi
 fi
 [[ "$IDS" =~ ^(crowdsec|fail2ban)$ ]] || { err "--ids must be crowdsec or fail2ban"; exit 1; }
 [[ -z "$SECTIONS" || "$SECTIONS" =~ ^[0-9,]+$ ]] || { err "--sections takes a comma list of numbers"; exit 1; }
@@ -1506,66 +1511,174 @@ sec_scanners() {
 
     # Weekly scan: ClamAV + unhide + package integrity + Lynis
     write_file /usr/local/sbin/starhard-scan 755 <<'EOF'
-#!/bin/sh
-# StarHard weekly scan. Output: /var/log/starhard/scan-<date>.log
+#!/usr/bin/env bash
+# StarHard weekly scan: ClamAV, unhide, package integrity, Lynis.
+# Interactive (terminal): live progress bars and stage summaries.
+# Timer / non-terminal: silent, log only.   Log: /var/log/starhard/scan-<date>.log
+# Options: --quiet (no terminal output)   --clam-only   --no-clam
+QUIET=0; CLAM_ONLY=0; NO_CLAM=0
+for a in "$@"; do case "$a" in --quiet) QUIET=1;; --clam-only) CLAM_ONLY=1;; --no-clam) NO_CLAM=1;; esac; done
+[[ -t 1 ]] || QUIET=1
+[[ $EUID -ne 0 ]] && { echo "Run as root: sudo starhard-scan"; exit 1; }
+
 mkdir -p /var/log/starhard
 LOG="/var/log/starhard/scan-$(date +%F).log"
+TMP="$(mktemp -d /tmp/starhard-scan.XXXXXX)"; trap 'rm -rf "$TMP"' EXIT
+T0=$(date +%s)
+C=$'\033[0;36m'; G=$'\033[0;32m'; Y=$'\033[1;33m'; R=$'\033[0;31m'; D=$'\033[2m'; N=$'\033[0m'
+if [[ "${LANG:-}${LC_ALL:-}" == *[Uu][Tt][Ff]* ]]; then FR=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏'); BF='█'; BE='░'; OK='✔'; BAD='✘'
+else FR=('|' '/' '-' '\\'); BF='#'; BE='.'; OK='OK'; BAD='XX'; fi
+
+say()   { [[ $QUIET -eq 1 ]] || echo "$@"; }
+stage() { [[ $QUIET -eq 1 ]] || { echo; echo -e "${C}━━ $1 ${D}$2${N}"; }; }
+fmt_t() { local s=$1; printf '%dm%02ds' $((s/60)) $((s%60)); }
+bar() {
+    # bar <done> <total> <label>   — one-line progress bar, redrawn in place
+    local done=$1 total=$2 label=$3 w=30 pct=0 fill
+    [[ $total -gt 0 ]] && pct=$(( done * 100 / total )); [[ $pct -gt 100 ]] && pct=100
+    fill=$(( pct * w / 100 ))
+    printf '\r  %s%s%s%s %3d%%  %s' "$(printf "$BF%.0s" $(seq 1 $fill))" "$D" "$(printf "$BE%.0s" $(seq 1 $((w-fill))))" "$N" "$pct" "$label"
+}
+spin() {
+    # spin <pid> <label>   — spinner with elapsed time until pid exits
+    local pid=$1 label=$2 i=0 s
+    s=$(date +%s)
+    while kill -0 "$pid" 2>/dev/null; do
+        [[ $QUIET -eq 0 ]] && printf '\r  %s %s  %s' "${FR[i % ${#FR[@]}]}" "$label" "$(fmt_t $(( $(date +%s) - s )))"
+        i=$((i+1)); sleep 0.2
+    done
+    [[ $QUIET -eq 0 ]] && printf '\r%*s\r' 70 ''
+}
+result() { [[ $QUIET -eq 1 ]] || echo -e "  $1"; }
+
 {
     echo "== starhard-scan $(date) =="
+} > "$LOG"
 
-    if command -v clamscan >/dev/null 2>&1; then
-        echo; echo "-- clamscan --"
-        # clamscan loads ~1 GB of signatures; skip on low-memory boxes (2 GB Pi etc.)
-        AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-        if [ "${AVAIL_KB:-0}" -lt 1500000 ]; then
-            echo "SKIPPED: only $((AVAIL_KB/1024)) MB RAM available (need ~1500 MB). Run clamscan manually when idle."
-            logger -t starhard-scan "clamscan skipped: low memory"
-        else
-        DIRS=""
-        for d in /etc /home /root /tmp /var/tmp /usr/local /opt /srv /var/www; do
-            [ -d "$d" ] && DIRS="$DIRS $d"
-        done
-        # Removable media currently mounted (USB sticks, SD cards)
-        for m in $(findmnt -rn -o TARGET 2>/dev/null | grep -E '^/(media|mnt|run/media)(/|$)'); do
-            DIRS="$DIRS $m"; echo "including removable media: $m"
-        done
-        # User/distro exclusions: /etc/starhard/clamav-exclude (one extended regex per line)
-        EXCL=""
-        if [ -s /etc/starhard/clamav-exclude ]; then
-            n=0
+say "${C}StarHard scan${N} — $(hostname), $(date '+%a %d %b %H:%M')  ${D}log: $LOG${N}"
+
+#---------------------------------------------------------------- ClamAV -----
+if command -v clamscan >/dev/null 2>&1 && [[ $NO_CLAM -eq 0 ]]; then
+    { echo; echo "-- clamscan --"; } >> "$LOG"
+    AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    if [[ "${AVAIL_KB:-0}" -lt 1500000 ]]; then
+        echo "SKIPPED: only $((AVAIL_KB/1024)) MB RAM available (need ~1500 MB). Run clamscan manually when idle." >> "$LOG"
+        logger -t starhard-scan "clamscan skipped: low memory"
+        stage "1/4 ClamAV malware scan" "skipped — only $((AVAIL_KB/1024)) MB RAM free"
+    else
+        DIRS=()
+        for d in /etc /home /root /tmp /var/tmp /usr/local /opt /srv /var/www; do [[ -d "$d" ]] && DIRS+=("$d"); done
+        while read -r m; do [[ -n "$m" ]] && { DIRS+=("$m"); echo "including removable media: $m" >> "$LOG"; }; done \
+            < <(findmnt -rn -o TARGET 2>/dev/null | grep -E '^/(media|mnt|run/media)(/|$)')
+        EXCL=(); n=0
+        if [[ -s /etc/starhard/clamav-exclude ]]; then
             while IFS= read -r pat; do
                 case "$pat" in ''|\#*) continue;; esac
-                EXCL="$EXCL --exclude-dir=$pat --exclude=$pat"; n=$((n+1))
+                EXCL+=("--exclude-dir=$pat" "--exclude=$pat"); n=$((n+1))
             done < /etc/starhard/clamav-exclude
-            echo "exclusions applied: $n pattern(s) from /etc/starhard/clamav-exclude"
+            echo "exclusions applied: $n pattern(s) from /etc/starhard/clamav-exclude" >> "$LOG"
         fi
-        # shellcheck disable=SC2086
-        clamscan -r -i --exclude-dir='^/(proc|sys|dev|run)' $EXCL $DIRS
+        stage "1/4 ClamAV malware scan" "${DIRS[*]}  ($n exclusion pattern(s))"
+        SIGS="$(ls /var/lib/clamav/*.c[lv]d 2>/dev/null | wc -l)"
+        SIGAGE=$(( ( $(date +%s) - $(stat -c %Y "$(ls -t /var/lib/clamav/daily.c[lv]d 2>/dev/null | head -1)" 2>/dev/null || echo "$T0") ) / 3600 ))
+        say "  ${D}signature databases: $SIGS, last updated ${SIGAGE}h ago${N}"
+
+        # Rough file count for the bar (exclusions not applied, so the bar may finish early)
+        find "${DIRS[@]}" -xdev -type f 2>/dev/null | wc -l > "$TMP/total" &
+        clamscan -r --exclude-dir='^/(proc|sys|dev|run)' "${EXCL[@]}" "${DIRS[@]}" > "$TMP/clam" 2>&1 &
+        CPID=$!
+        s=$(date +%s); total=0
+        while kill -0 "$CPID" 2>/dev/null; do
+            [[ $total -eq 0 && -s "$TMP/total" ]] && total=$(< "$TMP/total")
+            done=$(wc -l < "$TMP/clam" 2>/dev/null || echo 0)
+            inf=$(grep -c ' FOUND$' "$TMP/clam" 2>/dev/null || true)
+            if [[ $QUIET -eq 0 ]]; then
+                el=$(( $(date +%s) - s ))
+                if [[ $done -eq 0 ]]; then
+                    printf '\r  loading signatures… %s' "$(fmt_t $el)"
+                else
+                    rate=$(( el > 0 ? done / el : done ))
+                    lbl="$done/${total:-?} files  ${rate}/s  $(fmt_t $el)"
+                    [[ ${inf:-0} -gt 0 ]] && lbl="$lbl  ${R}${inf} FOUND${N}"
+                    bar "$done" "$total" "$lbl"
+                fi
+            fi
+            sleep 1
+        done
+        wait "$CPID"; CRC=$?
+        [[ $QUIET -eq 0 ]] && printf '\r%*s\r' 100 ''
+        # Log: hits + summary only (full per-file list would be hundreds of MB)
+        grep ' FOUND$' "$TMP/clam" >> "$LOG"
+        sed -n '/SCAN SUMMARY/,$p' "$TMP/clam" >> "$LOG"
+        INF=$(grep -m1 '^Infected files:' "$TMP/clam" | awk '{print $3}')
+        SCANNED=$(grep -m1 '^Scanned files:' "$TMP/clam" | awk '{print $3}')
+        if [[ "${INF:-0}" == "0" ]]; then
+            result "${G}${OK}${N} ${SCANNED:-?} files scanned, no malware  ${D}($(fmt_t $(( $(date +%s) - s ))))${N}"
+        elif [[ -z "$INF" ]]; then
+            result "${Y}!${N} clamscan exited $CRC without a summary — see $LOG"
+        else
+            result "${R}${BAD} $INF infected file(s):${N}"
+            grep ' FOUND$' "$TMP/clam" | sed 's/^/      /' | while read -r l; do say "$l"; done
         fi
     fi
+elif [[ $NO_CLAM -eq 0 ]]; then
+    stage "1/4 ClamAV" "not installed"
+fi
+[[ $CLAM_ONLY -eq 1 ]] && { logger -t starhard-scan "clam-only scan complete — see $LOG"; say; say "${D}done in $(fmt_t $(( $(date +%s) - T0 )))${N}"; exit 0; }
 
-    if command -v unhide >/dev/null 2>&1; then
-        echo; echo "-- unhide (hidden processes) --"
-        unhide proc
-        unhide sys
+#---------------------------------------------------------------- unhide -----
+if command -v unhide >/dev/null 2>&1; then
+    { echo; echo "-- unhide (hidden processes) --"; } >> "$LOG"
+    stage "2/4 Hidden process check (unhide)" "compares /proc, syscalls and brute-forced PIDs"
+    { unhide proc; unhide sys; } > "$TMP/unhide" 2>&1 &
+    spin $! "scanning PID space"
+    cat "$TMP/unhide" >> "$LOG"
+    if grep -q 'Found HIDDEN' "$TMP/unhide"; then
+        result "${R}${BAD} HIDDEN process reported — see $LOG${N}"
+    else
+        result "${G}${OK}${N} no hidden processes"
     fi
+fi
 
-    echo; echo "-- package integrity --"
-    if command -v debsums >/dev/null 2>&1; then
-        debsums -s
-    elif command -v rpm >/dev/null 2>&1; then
-        rpm -Va 2>/dev/null | grep '^..5' | grep -v '^.*c /etc/'
-    elif command -v pacman >/dev/null 2>&1; then
-        pacman -Qkk 2>/dev/null | grep -v ' 0 altered files'
-    fi
+#------------------------------------------------------- package integrity ---
+{ echo; echo "-- package integrity --"; } >> "$LOG"
+stage "3/4 Package integrity" "every installed file checked against its package checksum"
+if command -v debsums >/dev/null 2>&1; then
+    debsums -s > "$TMP/pkg" 2>&1 &
+elif command -v rpm >/dev/null 2>&1; then
+    { rpm -Va 2>/dev/null | grep '^..5' | grep -v '^.*c /etc/'; } > "$TMP/pkg" 2>&1 &
+elif command -v pacman >/dev/null 2>&1; then
+    { pacman -Qkk 2>/dev/null | grep -v ' 0 altered files'; } > "$TMP/pkg" 2>&1 &
+else
+    : > "$TMP/pkg"; true &
+fi
+spin $! "hashing package files"
+cat "$TMP/pkg" >> "$LOG"
+CHG=$(grep -c . "$TMP/pkg" || true)
+if [[ "${CHG:-0}" -eq 0 ]]; then
+    result "${G}${OK}${N} no modified package files"
+else
+    result "${Y}!${N} $CHG modified file(s) ${D}(edited configs are normal; binaries are not)${N}"
+    head -5 "$TMP/pkg" | sed 's/^/      /' | while read -r l; do say "$l"; done
+    [[ $CHG -gt 5 ]] && say "      ${D}… $((CHG-5)) more in $LOG${N}"
+fi
 
-    if command -v lynis >/dev/null 2>&1; then
-        echo; echo "-- lynis --"
-        lynis audit system --cronjob --quiet
-        echo "Full report: /var/log/lynis-report.dat"
-    fi
-} > "$LOG" 2>&1
+#----------------------------------------------------------------- Lynis -----
+if command -v lynis >/dev/null 2>&1; then
+    { echo; echo "-- lynis --"; } >> "$LOG"
+    stage "4/4 Lynis configuration audit" "~250 checks, read-only"
+    lynis audit system --cronjob --quiet > "$TMP/lynis" 2>&1 &
+    spin $! "auditing system configuration"
+    cat "$TMP/lynis" >> "$LOG"
+    echo "Full report: /var/log/lynis-report.dat" >> "$LOG"
+    IDX=$(grep -m1 '^hardening_index=' /var/log/lynis-report.dat 2>/dev/null | cut -d= -f2)
+    WN=$(grep -c '^warning\[\]=' /var/log/lynis-report.dat 2>/dev/null || true)
+    result "${G}${OK}${N} hardening index ${IDX:-?}/100, ${WN:-0} warning(s)  ${D}(starhard.sh --audit explains them)${N}"
+fi
+
 logger -t starhard-scan "weekly scan complete — see $LOG"
+say
+say "${D}done in $(fmt_t $(( $(date +%s) - T0 )))  •  sudo starhard-status for the digest${N}"
 exit 0
 EOF
     local scan_exec=/usr/local/sbin/starhard-scan
@@ -1579,6 +1692,14 @@ EOF
         record_rm /etc/starhard/ignore-units
         printf '# starhard-status: failed units to ignore, one per line (e.g. suricata, hostapd-wpe)\n' > /etc/starhard/ignore-units
     fi
+    if [[ $DRY_RUN -eq 0 && -f /etc/starhard/clamav-exclude ]] && grep -qx '/\\.msf4/' /etc/starhard/clamav-exclude; then
+        # v1.2 defaults with unbounded patterns: rewrite only the default lines, keep user additions
+        backup_file /etc/starhard/clamav-exclude
+        sed -i -E -e '\|^/\\\.msf4/$|d' -e '\|^\^/root/\\\.msf$|d' \
+            -e 's#^(\^/(etc|usr|var|opt)/[^( ]+)$#\1(/|$)#' /etc/starhard/clamav-exclude
+        echo '^/(root|home/[^/]+)/\.msf4(/|$)' >> /etc/starhard/clamav-exclude
+        info "ClamAV exclude list: tightened default patterns (anchored, bounded)"
+    fi
     if [[ $DRY_RUN -eq 0 && ! -e /etc/starhard/clamav-exclude ]]; then
         mkdir -p /etc/starhard
         record_rm /etc/starhard/clamav-exclude
@@ -1588,12 +1709,15 @@ EOF
             case "$OS_ID" in
                 kali|parrot|blackarch)
                     echo "# Defaults for $OS_ID — security tooling that ClamAV mistakes for malware:"
-                    printf '%s\n' '^/etc/unicornscan' '^/usr/share/unicornscan' '^/usr/share/metasploit-framework' \
-                        '^/usr/share/exploitdb' '^/usr/share/set' '^/usr/share/beef-xss' '^/usr/share/webshells' \
-                        '^/usr/share/windows-resources' '^/usr/share/wordlists' '^/usr/share/seclists' \
-                        '^/usr/share/nmap/scripts' '^/usr/share/sqlmap' '^/usr/share/responder' \
-                        '^/etc/suricata/rules' '^/var/lib/suricata' '^/etc/snort' '^/usr/share/doc/suricata' \
-                        '^/opt/metasploit' '^/root/\.msf' '/\.msf4/' ;;
+                    # Every pattern is anchored at the start and bounded at the end with (/|$), so
+                    # ^/usr/share/set(/|$) cannot swallow /usr/share/setuptools and a .msf4 dir only
+                    # counts under a real home directory, not /tmp/x/.msf4.
+                    printf '%s\n' '^/etc/unicornscan(/|$)' '^/usr/share/unicornscan(/|$)' '^/usr/share/metasploit-framework(/|$)' \
+                        '^/usr/share/exploitdb(/|$)' '^/usr/share/set(/|$)' '^/usr/share/beef-xss(/|$)' '^/usr/share/webshells(/|$)' \
+                        '^/usr/share/windows-resources(/|$)' '^/usr/share/wordlists(/|$)' '^/usr/share/seclists(/|$)' \
+                        '^/usr/share/nmap/scripts(/|$)' '^/usr/share/sqlmap(/|$)' '^/usr/share/responder(/|$)' \
+                        '^/etc/suricata/rules(/|$)' '^/var/lib/suricata(/|$)' '^/etc/snort(/|$)' '^/usr/share/doc/suricata(/|$)' \
+                        '^/opt/metasploit(/|$)' '^/(root|home/[^/]+)/\.msf4(/|$)' ;;
                 *) echo '# (none by default on this distro)' ;;
             esac
         } > /etc/starhard/clamav-exclude
@@ -2242,7 +2366,13 @@ lynis_summary() {
             sec="$(lynis_section_for "$id")"
             printf '  %-10s %s' "$id" "$desc"
             [[ -n "$detail" && "$detail" != "-" ]] && printf ' [%s]' "$detail"
-            [[ -n "$sec" ]] && printf '  -> StarHard section %s' "$sec"
+            if [[ "$id" == "NETW-3015" && "$desc$detail" =~ (tailscale|wg[0-9]|tun[0-9]|zt[a-z0-9]+|nebula) ]]; then
+                printf '  -> n/a (VPN tunnel interface; expected)'
+            elif [[ "$id" == "NETW-3015" ]]; then
+                printf '  -> check: bridge link; ss -0lp  (bridge member or packet sniffer?)'
+            elif [[ -n "$sec" ]]; then
+                printf '  -> StarHard section %s' "$sec"
+            fi
             echo
         done < <(grep '^warning\[\]=' "$rep")
     fi

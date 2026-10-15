@@ -24,7 +24,7 @@ Architectures: x86_64 and aarch64 (Raspberry Pi 4/5, other ARM boards). StarHard
 
 ## Installation
 
-1. Download `StarHard.sh` (and optionally `starhard-status`, which the script also installs for you).
+1. Download `StarHard.sh`.
 2. Make it executable:
 
    ```bash
@@ -33,7 +33,16 @@ Architectures: x86_64 and aarch64 (Raspberry Pi 4/5, other ARM boards). StarHard
 
 3. Skim it before running. Never run a root script you haven't at least glanced at.
 
-StarHard is a single self-contained file. Everything it installs onto the system (`starhard-scan`, `starhard-status`, `starhard-aide-check`, `starhard-usb-allow`) is written by the script itself into `/usr/local/sbin/`.
+**You only need `StarHard.sh`.** It is self-contained and writes the helper commands (`starhard-status`, `starhard-scan`, `starhard-aide-check`, `starhard-usb-allow`) into `/usr/local/sbin/` itself: section 11 installs `starhard-scan` and `starhard-status`, section 10 installs `starhard-aide-check`, section 20 installs `starhard-usb-allow`. Re-running those sections updates them.
+
+The repository also ships `starhard-status` and `starhard-scan` as standalone files. They are the same content the script writes, provided so you can update one helper without re-running a section:
+
+```bash
+sudo install -m 755 starhard-status /usr/local/sbin/starhard-status
+sudo install -m 755 starhard-scan   /usr/local/sbin/starhard-scan
+```
+
+Either way ends up identical; `sudo ./StarHard.sh --sections 11` is the simpler route.
 
 ---
 
@@ -72,7 +81,8 @@ sudo ./StarHard.sh [options]
   --profile <p>         desktop (default) or server
   --sections a,b,c      Run only these section numbers
   --exclude a,b,c       Skip these section numbers
-  --ids <i>             crowdsec or fail2ban for section 8 (default: crowdsec on server, fail2ban on desktop)
+  --ids <i>             crowdsec or fail2ban for section 8 (default: whichever is already installed,
+                        else crowdsec on server / fail2ban on desktop)
   --pihole-lan          Pi-hole: always open DNS/web to LAN subnets
   --no-lan-dns          Pi-hole: never open DNS/web to LAN (e.g. a Tailscale-only Pi-hole)
   --pi-disable-wifi     Raspberry Pi: disable the on-board Wi-Fi radio (refused if you're connected over it)
@@ -125,14 +135,14 @@ sudo ./StarHard.sh --audit                          # compliance check, no chang
 | 8 | Intrusion prevention | **CrowdSec** (official repo, nftables/iptables bouncer, linux+sshd collections, journal acquisition, loopback whitelist; fail2ban stopped and masked so the two never fight) or **fail2ban** (sshd + recidive jail, recidive fixed to `backend=auto`) |
 | 9 | auditd | Identity files, sudoers, cron, SSH/PAM/MAC config, module loading, time changes, privilege escalation, mounts, deletions, permission changes, `/etc/ld.so.preload`, opens of `/dev/input/` by users (keylogger indicator), Pi boot config. Correct syscall names on aarch64. **De-duplicates against rules other tools already placed in `rules.d/`**, detects immutable mode. Process accounting + sysstat enabled |
 | 10 | AIDE | Baseline database on first run; daily check timer (or defers to the distro's own daily job) |
-| 11 | Scanning | Weekly `starhard-scan` timer: **ClamAV** (incl. mounted removable media; skips when < 1.5 GB RAM is free; honours an exclusion list at `/etc/starhard/clamav-exclude`, pre-filled on Parrot/Kali with the tool directories that contain exploit code by design), **unhide**, package integrity (debsums / `rpm -V` / `pacman -Qkk`), **Lynis**. Holds idle-suspend while running so laptops finish. Installs **`starhard-status`**. Offers to remove legacy rkhunter/chkrootkit |
+| 11 | Scanning | Weekly `starhard-scan` timer: **ClamAV** (incl. mounted removable media; skips when < 1.5 GB RAM is free; honours an exclusion list at `/etc/starhard/clamav-exclude`, pre-filled on Parrot/Kali with the tool directories that contain exploit code by design — every pattern anchored and bounded), **unhide**, package integrity (debsums / `rpm -V` / `pacman -Qkk`), **Lynis**. Run from a terminal it shows a live progress bar and per-stage results; from the timer it's silent. Holds idle-suspend while running so laptops finish. Installs **`starhard-status`**. Offers to remove legacy rkhunter/chkrootkit |
 | 12 | Auto-updates | unattended-upgrades (security origin, unused-dep removal, no auto-reboot; **+ Raspberry Pi Foundation and Tailscale origins** when detected), dnf-automatic, or a zypper patch timer. Warns on rolling distros (Parrot/Kali) where there's no security pocket |
 | 13 | Banners, permissions, sudo | Legal banners (`/etc/issue`, `issue.net`, sshd `Banner`); **tighten-only** permissions (`chmod o-rwx` — never loosens RHEL's 0000 shadow); cron dirs, sudoers.d, grub.cfg, home directories; sudo `use_pty`, `logfile`, `log_input` |
 | 14 | MAC | AppArmor enabled; profiles set to enforce (server: automatic, desktop: prompted — see FAQ). SELinux status reported |
 | 15 | Services, mounts, journald | ctrl-alt-del masked; persistent journald with 500 MB cap; `/dev/shm` `nodev,nosuid,noexec`. Server: `/tmp` + `/var/tmp` hardened, avahi/cups/bluetooth masked |
 | 16 | Cleanup | Legacy plaintext clients (rsh, tftp, talk, telnetd) purged if present; residual configs; `autoremove`; **opt-in** Docker prune (never with `-y`) |
 | 17 | GRUB password | Optional, interactive. Password read silently; normal boots stay unrestricted. Uses `grub2-setpassword` on RHEL/Fedora. Skipped on Raspberry Pi |
-| 18 | Lynis | Installs Lynis if missing, runs a full audit **last**, prints warnings and suggestions with each mapped to the StarHard section that addresses it (`-> section N`) or `-> manual`, annotates known false positives, tracks the hardening index across runs in `/var/lib/starhard/lynis-index` |
+| 18 | Lynis | Installs Lynis if missing, runs a full audit **last**, prints warnings and suggestions with each mapped to the StarHard section that addresses it (`-> section N`) or `-> manual`, annotates known false positives (yescrypt rounds, promiscuous VPN tunnel interfaces) and prints the diagnostic commands for a real promiscuous interface, tracks the hardening index across runs in `/var/lib/starhard/lynis-index` |
 | 19 | Raspberry Pi | *Auto-detected.* No-bootloader-password / encryption warning, EEPROM update check and staging, `dtoverlay=disable-bt` / `disable-wifi` (Wi-Fi refused if that's how you're connected), auditd watches on `config.txt` / `cmdline.txt`, serial console removed on server, low-RAM note for ClamAV |
 | 20 | USB device control | **USBGuard on every profile** (installs it if missing). Devices attached at setup are allowed. *Desktop:* audit mode (all attaches logged to auditd) plus hard blocks on USB network adapters (PoisonTap class) and HID-carrying hubs (injector cables), and **new HID blocked while the screen is locked**. *Server:* everything unknown blocked. StarHard's rules live in `/etc/usbguard/rules.d/` so a package upgrade can't erase them; daemon IPC is restricted to root (closes Debian bugs #1134751/#1135310). `starhard-usb-allow <id>` authorises a device |
 
@@ -158,6 +168,32 @@ One screen, `OK` / `--` / `!!` per line, ending in *Nothing needs attention* or 
 - **Lynis** — last hardening index
 
 Everything else runs on its own: ClamAV signatures every few hours, AIDE nightly, the full scan weekly, security updates daily.
+
+### `starhard-scan` — running it yourself
+
+```bash
+sudo starhard-scan              # full scan, ~10–25 min
+sudo starhard-scan --clam-only  # just ClamAV
+sudo starhard-scan --no-clam    # unhide + integrity + Lynis (a couple of minutes)
+```
+
+From a terminal it narrates each of the four stages:
+
+```
+━━ 1/4 ClamAV malware scan /etc /home /root /tmp … (19 exclusion pattern(s))
+  signature databases: 3, last updated 2h ago
+  ████████████░░░░░░░░░░░░░░░░░░  41%  92,410/225,517 files  310/s  4m58s
+  ✔ 225,517 files scanned, no malware  (12m03s)
+━━ 2/4 Hidden process check (unhide)
+  ✔ no hidden processes
+━━ 3/4 Package integrity
+  ! 7 modified file(s)  (edited configs are normal; binaries are not)
+━━ 4/4 Lynis configuration audit
+  ✔ hardening index 84/100, 1 warning(s)
+done in 18m22s  •  sudo starhard-status for the digest
+```
+
+The ClamAV bar shows files done/total, throughput and elapsed time, and a red `N FOUND` counter appears the moment anything matches. Under the weekly timer (no terminal) it prints nothing and writes the same log `starhard-status` reads. `--quiet` forces that from a terminal.
 
 ### What it deliberately does NOT do
 
@@ -202,7 +238,7 @@ Installed by StarHard into `/usr/local/sbin/` (all need `sudo`):
 | Command | Purpose |
 |---|---|
 | `starhard-status [--days N]` | One-screen digest of everything (default 7 days) |
-| `starhard-scan` | Run the full ClamAV + unhide + integrity + Lynis scan now |
+| `starhard-scan [--clam-only\|--no-clam\|--quiet]` | Run the full ClamAV + unhide + integrity + Lynis scan now, with live progress |
 | `starhard-aide-check` | Run an AIDE integrity check now |
 | `starhard-usb-allow [id]` | List blocked USB devices / permanently allow one |
 
@@ -246,7 +282,7 @@ Logs: `/var/log/starhard/` (`starhard-<ts>.log` per run, `scan-<date>.log`, `aid
 
 **Weekly scan never finishes on my laptop** — v1.2 holds idle-suspend during the scan. Lid-close still wins; run `sudo starhard-scan` manually when the lid will stay open.
 
-**Lynis says NETW-3015 promiscuous interface** — not StarHard. Check for a bridge (`bridge link`) or a sniffer holding a raw socket (`sudo ss -0lp`).
+**Lynis says NETW-3015 promiscuous interface** — not StarHard. For `tailscale0` / `wg*` / `tun*` it's expected and StarHard marks it n/a. For a physical interface, check for a bridge (`bridge link`) or a sniffer holding a raw socket (`sudo ss -0lp`).
 
 ---
 
@@ -290,6 +326,9 @@ Logs: `/var/log/starhard/` (`starhard-<ts>.log` per run, `scan-<date>.log`, `aid
 - Scan holds idle-suspend; failed-unit ignore list; ClamAV exclusion list with pentest-distro defaults
 - apt-listbugs aware installs (shows bugs, lifts leftover pins); USBGuard rules in `rules.d/`, IPC root-only; section 20 installs usbguard itself
 - `starhard-status`: keylogger indicators, USB device section with HID/NET/BT/STORAGE tags, dual-IPS and missing-bouncer detection, stale-AIDE and scan-in-progress states
+- `starhard-scan`: live progress bar, spinners and per-stage results in a terminal; `--clam-only` / `--no-clam` / `--quiet`
+- `--ids` defaults to the IPS already installed; Lynis promiscuous-interface warnings annotated for VPN tunnels
+- ClamAV exclusion defaults anchored and bounded (`^…(/|$)`; `.msf4` only under real home directories), with in-place migration of an existing list
 
 **1.1** — initial multi-distro release.
 
