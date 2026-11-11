@@ -1,0 +1,37 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Embedded helpers match the standalone files
+        run: tools/embed.sh --check
+      - name: bash -n and ShellCheck
+        run: make lint
+
+  distros:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - docker.io/library/debian:12
+          - docker.io/library/ubuntu:24.04
+          - docker.io/library/fedora:41
+          - docker.io/rockylinux/rockylinux:9
+          - docker.io/opensuse/leap:15.6
+          - docker.io/library/archlinux:latest
+          - docker.io/library/alpine:3.20
+    steps:
+      - uses: actions/checkout@v4
+      - name: dry-run, apply, audit, idempotency, rollback
+        run: ENGINE=docker tests/run-matrix.sh ${{ matrix.image }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: log-${{ strategy.job-index }}
+          path: tests/logs/

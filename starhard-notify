@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# starhard-notify — run starhard-status and push the result, but only when it CHANGES.
+# Runs daily from starhard-notify.timer. Nothing is sent while the set of "!!" items stays the same,
+# so a hook can be as loud as you like (mail, phone push) without becoming noise.
+#
+# Usage: sudo starhard-notify [--force] [--test]
+#   --force   notify even if nothing changed since the last run
+#   --test    send a test message through every enabled hook and exit
+#
+# Hooks: every executable file in /etc/starhard/notify.d/ (root-owned, not group/world-writable,
+# name not ending in .example) is run with the plain-text digest on stdin and these variables:
+#   STARHARD_HOST      hostname
+#   STARHARD_ISSUES    number of "!!" items now
+#   STARHARD_PREVIOUS  number at the last notification
+#   STARHARD_STATE     new-issues | changed | resolved | test
+#   STARHARD_SUMMARY   one line, e.g. "myhost: 2 item(s) need attention"
+#   STARHARD_ITEMS     the "!!" lines, one per line
+# Settings shared by the shipped examples live in /etc/starhard/notify.conf.
+FORCE=0; TEST=0
+for a in "$@"; do
+    case "$a" in
+        --force) FORCE=1 ;;
+        --test)  TEST=1 ;;
+        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "Unknown option: $a" >&2; exit 2 ;;
+    esac
+done
+[[ $EUID -ne 0 ]] && { echo "Run as root: sudo starhard-notify" >&2; exit 2; }
+
+STATE_DIR=/var/lib/starhard
+HOOK_DIR=/etc/starhard/notify.d
+STATUS="$(command -v starhard-status || echo /usr/local/sbin/starhard-status)"
+mkdir -p "$STATE_DIR"
+HOST="$(uname -n)"
+
+run_hooks() {
+    # run_hooks <digest-file>
+    local digest="$1" h ran=0 mode owner
+    [[ -d "$HOOK_DIR" ]] || return 0
+    for h in "$HOOK_DIR"/*; do
+        [[ -f "$h" && -x "$h" && "$h" != *.example ]] || continue
+        # A hook runs as root: refuse anything a non-root user could have edited.
+        owner="$(stat -c %u "$h")"; mode="$(stat -c %a "$h")"
+        if [[ "$owner" != "0" || $(( 8#$mode & 8#022 )) -ne 0 ]]; then
+            logger -t starhard-notify "skipping $h: must be owned by root and not group/world-writable"
+            continue
+        fi
+        if timeout 60 "$h" < "$digest" >/dev/null 2>&1; then ran=$((ran+1))
+        else logger -t starhard-notify "hook $h failed (exit $?)"; fi
+    done
+    echo "$ran"
+}
+
+TMP="$(mktemp -d /tmp/starhard-notify.XXXXXX)"; trap 'rm -rf "$TMP"' EXIT
+
+if [[ $TEST -eq 1 ]]; then
+    printf 'This is a test notification from starhard-notify on %s.\n' "$HOST" > "$TMP/digest"
+    export STARHARD_HOST="$HOST" STARHARD_ISSUES=0 STARHARD_PREVIOUS=0 STARHARD_STATE=test
+    export STARHARD_SUMMARY="$HOST: StarHard test notification" STARHARD_ITEMS=""
+    n="$(run_hooks "$TMP/digest")"
+    echo "Test sent through ${n:-0} hook(s) in $HOOK_DIR"
+    [[ "${n:-0}" -gt 0 ]] || echo "No enabled hooks. Copy an example: cp $HOOK_DIR/20-ntfy.example $HOOK_DIR/20-ntfy && chmod 700 $HOOK_DIR/20-ntfy"
+    exit 0
+fi
+
+"$STATUS" > "$TMP/digest" 2>&1; rc=$?
+if [[ $rc -ge 2 ]]; then
+    logger -t starhard-notify "starhard-status failed (exit $rc)"
+    exit 1
+fi
+# The "!!" lines are the alert content. Numbers are masked for the comparison so that
+# "23 failed logins" -> "31 failed logins" does not count as a new problem every day.
+ITEMS="$(grep -E '^  !!' "$TMP/digest" | sed -E 's/^  !! +//')"
+ISSUES="$(grep -cE '^  !!' "$TMP/digest" || true)"
+FP="$(printf '%s\n' "$ITEMS" | sed -E 's/[0-9]+/#/g' | sort | sha256sum | cut -d' ' -f1)"
+PREV_FP=""; PREV_N=0
+if [[ -r "$STATE_DIR/notify-state" ]]; then
+    read -r PREV_FP PREV_N < "$STATE_DIR/notify-state"
+    [[ "$PREV_N" =~ ^[0-9]+$ ]] || PREV_N=0
+fi
+
+# Login banner: always current, even when no hook is configured
+if [[ $ISSUES -gt 0 ]]; then SUMMARY="$HOST: $ISSUES item(s) need attention — sudo starhard-status"
+else SUMMARY="$HOST: nothing needs attention"; fi
+printf '%s %s\n' "$(date '+%F %H:%M')" "$SUMMARY" > "$STATE_DIR/last-status"
+chmod 644 "$STATE_DIR/last-status"
+
+if [[ "$FP" == "$PREV_FP" && $FORCE -eq 0 ]]; then
+    exit 0
+fi
+if   [[ $ISSUES -eq 0 && $PREV_N -eq 0 && $FORCE -eq 0 ]]; then
+    # first run on a clean system: record the state, say nothing
+    printf '%s %s\n' "$FP" "$ISSUES" > "$STATE_DIR/notify-state"; exit 0
+elif [[ $ISSUES -eq 0 ]];   then STATE=resolved
+elif [[ $PREV_N -eq 0 ]];   then STATE=new-issues
+else                             STATE=changed
+fi
+
+export STARHARD_HOST="$HOST" STARHARD_ISSUES="$ISSUES" STARHARD_PREVIOUS="$PREV_N" STARHARD_STATE="$STATE"
+export STARHARD_SUMMARY="$SUMMARY" STARHARD_ITEMS="$ITEMS"
+n="$(run_hooks "$TMP/digest")"
+logger -t starhard-notify "$SUMMARY (state: $STATE, ${n:-0} hook(s) notified)"
+printf '%s %s\n' "$FP" "$ISSUES" > "$STATE_DIR/notify-state"
+exit 0

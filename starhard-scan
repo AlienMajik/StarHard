@@ -8,7 +8,7 @@ for a in "$@"; do case "$a" in --quiet) QUIET=1;; --clam-only) CLAM_ONLY=1;; --n
 [[ -t 1 ]] || QUIET=1
 [[ $EUID -ne 0 ]] && { echo "Run as root: sudo starhard-scan"; exit 1; }
 
-mkdir -p /var/log/starhard
+mkdir -p /var/log/starhard /var/lib/starhard
 LOG="/var/log/starhard/scan-$(date +%F).log"
 TMP="$(mktemp -d /tmp/starhard-scan.XXXXXX)"; trap 'rm -rf "$TMP"' EXIT
 T0=$(date +%s)
@@ -42,7 +42,7 @@ result() { [[ $QUIET -eq 1 ]] || echo -e "  $1"; }
     echo "== starhard-scan $(date) =="
 } > "$LOG"
 
-say "${C}StarHard scan${N} — $(hostname), $(date '+%a %d %b %H:%M')  ${D}log: $LOG${N}"
+say "${C}StarHard scan${N} — $(uname -n), $(date '+%a %d %b %H:%M')  ${D}log: $LOG${N}"
 
 #---------------------------------------------------------------- ClamAV -----
 if command -v clamscan >/dev/null 2>&1 && [[ $NO_CLAM -eq 0 ]]; then
@@ -51,6 +51,9 @@ if command -v clamscan >/dev/null 2>&1 && [[ $NO_CLAM -eq 0 ]]; then
     if [[ "${AVAIL_KB:-0}" -lt 1500000 ]]; then
         echo "SKIPPED: only $((AVAIL_KB/1024)) MB RAM available (need ~1500 MB). Run clamscan manually when idle." >> "$LOG"
         logger -t starhard-scan "clamscan skipped: low memory"
+        # Count consecutive skips so starhard-status can escalate a scan that never runs (small Pis)
+        SK="$(cat /var/lib/starhard/clam-skips 2>/dev/null || echo 0)"; [[ "$SK" =~ ^[0-9]+$ ]] || SK=0
+        echo $((SK+1)) > /var/lib/starhard/clam-skips
         stage "1/4 ClamAV malware scan" "skipped — only $((AVAIL_KB/1024)) MB RAM free"
     else
         DIRS=()
@@ -93,6 +96,7 @@ if command -v clamscan >/dev/null 2>&1 && [[ $NO_CLAM -eq 0 ]]; then
             sleep 1
         done
         wait "$CPID"; CRC=$?
+        echo 0 > /var/lib/starhard/clam-skips
         [[ $QUIET -eq 0 ]] && printf '\r%*s\r' 100 ''
         # Log: hits + summary only (full per-file list would be hundreds of MB)
         grep ' FOUND$' "$TMP/clam" >> "$LOG"
